@@ -6,15 +6,13 @@
 # then `ditto -c -k --keepParent menubar/.build/amtrino.app amtrino-<version>.zip`,
 # attach the zip to the GitHub release, and fill sha256 below.
 cask "amtrino" do
-  version "0.1.0"
+  version "0.1.1"
   sha256 "33786330cd939688eeed3a84b9f680eae3ca53bb00adee5d3c1bf52a3a66b00e"
 
   url "https://github.com/arian-shamaei/amtrino/releases/download/v#{version}/amtrino-#{version}.zip"
   name "amtrino"
-  desc "Menu bar companion for amtr: live Claude Code session dots and context gauge"
+  desc "Live menu bar dots for local AI coding sessions (Claude Code, Codex CLI)"
   homepage "https://github.com/arian-shamaei/amtrino"
-
-  depends_on macos: ">= :ventura"
 
   app "amtrino.app"
 
