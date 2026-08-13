@@ -7,7 +7,7 @@
 # attach the zip to the GitHub release, and fill sha256 below.
 cask "amtrino" do
   version "0.1.0"
-  sha256 "41fc34a1c3f07ff14cbf1818ae1f36ca5204727aa2a53027a12b5e63ac73c605"
+  sha256 "33786330cd939688eeed3a84b9f680eae3ca53bb00adee5d3c1bf52a3a66b00e"
 
   url "https://github.com/arian-shamaei/amtrino/releases/download/v#{version}/amtrino-#{version}.zip"
   name "amtrino"
