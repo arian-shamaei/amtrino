@@ -6,8 +6,8 @@
 # then `ditto -c -k --keepParent menubar/.build/amtrino.app amtrino-<version>.zip`,
 # attach the zip to the GitHub release, and fill sha256 below.
 cask "amtrino" do
-  version "0.1.1"
-  sha256 "33786330cd939688eeed3a84b9f680eae3ca53bb00adee5d3c1bf52a3a66b00e"
+  version "0.3.0"
+  sha256 "43e0a5986f854de775e23285315dc60faacfb644da8ccd3b6ec07681345a9e76"
 
   url "https://github.com/arian-shamaei/amtrino/releases/download/v#{version}/amtrino-#{version}.zip"
   name "amtrino"
