@@ -1,38 +1,27 @@
-// The menu's session-assignment section: ONE custom menu-item view holding
-// every open session as a row and, below them, the 9 grid nodes. Drag a
-// session row onto a node to pin it there; click a row to show/hide it;
-// click an occupied node to clear it. All tracking is internal mouse
-// handling (NSDraggingSession would dismiss the tracking menu), so the menu
-// stays open while you arrange the grid.
+// The menu's 3×3 node grid — EXACTLY the menu bar icon's layout (node 1 =
+// top-left … node 9 = bottom-right), so dropping a session somewhere means
+// putting it THERE in the bar. One custom menu-item view; the session rows
+// are their own items (SessionRowView) and report their drags here, since
+// standard menu items cannot be dragged and a drag must cross items.
 
 import AppKit
 
 final class AssignSectionView: NSView {
-    // inputs, set before the menu opens
-    private var rows: [DisplaySession] = []          // all live sessions
-    private var slotOf: [String: Int] = [:]          // session id -> node
     private var slots: [DisplaySession?] = []        // current 9-node layout
     private var reserved: Set<Int> = []              // assigned node indices
-    /// repaint the status item after any change
+    private var cfg: [String?] = []
+    /// repaint the status item + sibling row views after any change
     var onChange: (() -> Void)?
 
-    // geometry — the nodes are a 3×3 grid in EXACTLY the menu bar icon's
-    // layout (node 1 = top-left … node 9 = bottom-right), so dropping a
-    // session somewhere means putting it THERE in the bar
-    private let rowH: CGFloat = 22
+    // geometry
     private let nodeD: CGFloat = 34
     private let nodeGap: CGFloat = 7
-    private let leftPad: CGFloat = 22
-    private let hintH: CGFloat = 4
     private var nodesH: CGFloat { nodeD * 3 + nodeGap * 2 + 12 }
 
-    // interaction state
-    private var hoverRow: Int?
+    // live drag state, fed by the SessionRowView that owns the mouse
+    private var dropSess: DisplaySession?
+    private var dropPoint: NSPoint?
     private var hoverNode: Int?
-    private var pressRow: Int?
-    private var dragging = false
-    private var dragPoint = NSPoint.zero
-    private var tracking: NSTrackingArea?
 
     init(width: CGFloat) {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 10))
@@ -40,26 +29,11 @@ final class AssignSectionView: NSView {
 
     required init?(coder: NSCoder) { nil }
 
-    private var dupNames: Set<String> = []
-
-    private var cfg: [String?] = []
-
     func reload(store: FleetStore) {
-        rows = store.sessions.filter { $0.status.isLiveish }
-            .map { DisplaySession(sess: $0, finishedAgo: nil) }
-        var counts: [String: Int] = [:]
-        for d in rows { counts[d.sess.name, default: 0] += 1 }
-        dupNames = Set(counts.filter { $0.value > 1 }.map(\.key))
         cfg = Settings.slots
         slots = store.slotted(hidden: Settings.hidden, slots: cfg)
-        slotOf = [:]
-        for (i, d) in slots.enumerated() {
-            if let d { slotOf[d.sess.id] = i }
-        }
         reserved = Set((0..<9).filter { $0 < cfg.count && cfg[$0] != nil })
-        setFrameSize(NSSize(
-            width: frame.width,
-            height: CGFloat(rows.count) * rowH + hintH + nodesH))
+        setFrameSize(NSSize(width: frame.width, height: nodesH))
         needsDisplay = true
     }
 
@@ -69,14 +43,7 @@ final class AssignSectionView: NSView {
         i < cfg.count && cfg[i] != nil && cfg[i] != Settings.emptySlot
     }
 
-    // MARK: geometry helpers — nodes on TOP, sessions below
-
-    private var rowsTop: CGFloat { bounds.height - nodesH - hintH }
-
-    private func rowRect(_ i: Int) -> NSRect {
-        NSRect(x: 0, y: rowsTop - CGFloat(i + 1) * rowH,
-               width: bounds.width, height: rowH)
-    }
+    // MARK: geometry
 
     private func nodeRect(_ i: Int) -> NSRect {
         let col = CGFloat(i % 3), row = CGFloat(i / 3)
@@ -89,14 +56,49 @@ final class AssignSectionView: NSView {
                       width: nodeD, height: nodeD)
     }
 
-    private func rowAt(_ p: NSPoint) -> Int? {
-        guard p.y < rowsTop else { return nil }
-        let i = Int((rowsTop - p.y) / rowH)
-        return (0..<rows.count).contains(i) ? i : nil
-    }
-
     private func nodeAt(_ p: NSPoint) -> Int? {
         (0..<9).first { nodeRect($0).insetBy(dx: -4, dy: -4).contains(p) }
+    }
+
+    private func fromScreen(_ p: NSPoint) -> NSPoint? {
+        guard let w = window else { return nil }
+        return convert(w.convertPoint(fromScreen: p), from: nil)
+    }
+
+    // MARK: drag interface (called by SessionRowView)
+
+    func dragUpdate(_ d: DisplaySession, screenPoint: NSPoint) {
+        guard let p = fromScreen(screenPoint) else { return }
+        dropSess = d
+        dropPoint = p
+        hoverNode = nodeAt(p)
+        needsDisplay = true
+    }
+
+    /// Finish a drag; pins when the drop landed on a node.
+    @discardableResult
+    func dragDrop(_ d: DisplaySession, screenPoint: NSPoint) -> Bool {
+        defer {
+            dropSess = nil
+            dropPoint = nil
+            hoverNode = nil
+            needsDisplay = true
+        }
+        guard let p = fromScreen(screenPoint), let n = nodeAt(p)
+        else { return false }
+        var s = Settings.slots
+        for j in 0..<s.count where s[j] == d.sess.id { s[j] = nil }
+        s[n] = d.sess.id
+        Settings.slots = s
+        onChange?()
+        return true
+    }
+
+    func dragCancel() {
+        dropSess = nil
+        dropPoint = nil
+        hoverNode = nil
+        needsDisplay = true
     }
 
     // MARK: drawing
@@ -106,79 +108,13 @@ final class AssignSectionView: NSView {
         IconRenderer.barIsDark = effectiveAppearance
             .bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let now = Date()
-        let occupied = slots.enumerated().compactMap { $1 == nil ? nil : $0 }
 
-        // session rows (below the nodes). No checkmark column: the glyph
-        // already says everything — mini-map = in the bar, lone dot = not —
-        // and a HIDDEN session renders dimmed instead.
-        for (i, d) in rows.enumerated() {
-            let r = rowRect(i)
-            if hoverRow == i && !dragging {
-                NSColor.selectedContentBackgroundColor
-                    .withAlphaComponent(0.25).setFill()
-                NSBezierPath(roundedRect: r.insetBy(dx: 6, dy: 1),
-                             xRadius: 5, yRadius: 5).fill()
-            }
-            let hidden = Settings.hidden.contains(d.sess.id)
-            let alpha: CGFloat = hidden ? 0.35 : 1.0
-            let map = IconRenderer.menuDot(
-                d, gridIndex: slotOf[d.sess.id], occupied: occupied, now: now)
-            map.draw(in: NSRect(x: 12, y: r.minY + 2, width: 18, height: 18),
-                     from: .zero, operation: .sourceOver, fraction: alpha)
-
-            // invisible table: name | project | % | badge, fixed columns,
-            // tail-truncated so no field can shove its neighbors
-            let trunc = NSMutableParagraphStyle()
-            trunc.lineBreakMode = .byTruncatingTail
-            let nameColor = hidden ? NSColor.tertiaryLabelColor
-                                   : NSColor.labelColor
-            let tag = dupNames.contains(d.sess.name)
-                ? " [\(d.sess.id.prefix(4))]" : ""
-            ("\(d.sess.name)\(tag)" as NSString).draw(
-                in: NSRect(x: 38, y: r.minY + 3, width: 150, height: 16),
-                withAttributes: [
-                    .font: NSFont.menuFont(ofSize: 13),
-                    .foregroundColor: nameColor,
-                    .paragraphStyle: trunc])
-            let proj = d.sess.provider == "claude"
-                ? d.sess.projectTail
-                : "\(d.sess.projectTail) · \(d.sess.provider)"
-            (proj as NSString).draw(
-                in: NSRect(x: 196, y: r.minY + 3, width: 104, height: 16),
-                withAttributes: [
-                    .font: NSFont.menuFont(ofSize: 13),
-                    .foregroundColor: hidden
-                        ? NSColor.tertiaryLabelColor
-                        : NSColor.secondaryLabelColor,
-                    .paragraphStyle: trunc])
-            if let f = d.sess.fill {
-                let pct = "\(Int((f * 100).rounded()))%" as NSString
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedDigitSystemFont(
-                        ofSize: 12, weight: .regular),
-                    .foregroundColor: hidden
-                        ? NSColor.tertiaryLabelColor
-                        : NSColor.secondaryLabelColor]
-                let sz = pct.size(withAttributes: attrs)
-                pct.draw(at: NSPoint(x: 340 - sz.width, y: r.minY + 4),
-                         withAttributes: attrs)
-            }
-            // badge column: pin location, or the hidden marker
-            if let n = slotOf[d.sess.id], reserved.contains(n) {
-                ("⌖\(n + 1)" as NSString).draw(
-                    at: NSPoint(x: 348, y: r.minY + 3),
-                    withAttributes: [
-                        .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-                        .foregroundColor: NSColor.controlAccentColor])
-            } else if hidden {
-                ("off" as NSString).draw(
-                    at: NSPoint(x: 348, y: r.minY + 4),
-                    withAttributes: [
-                        .font: NSFont.systemFont(ofSize: 10, weight: .medium),
-                        .foregroundColor: NSColor.tertiaryLabelColor])
-            }
+        // visual-validation hook: node 1's screen rect, for automation
+        if ProcessInfo.processInfo.environment["AMTRINO_DUMP"] != nil,
+           let w = window {
+            let sr = w.convertToScreen(convert(nodeRect(0), to: nil))
+            NSLog("%@", "amtrino nodeframe 1: \(NSStringFromRect(sr))")
         }
-
 
         // the 9 nodes. Ring language must mirror REALITY in the bar:
         // every occupied node reads identically (they are all shown);
@@ -188,7 +124,7 @@ final class AssignSectionView: NSView {
             let r = nodeRect(i)
             let occupiedHere = (slots[safe: i] ?? nil) != nil
             let ring = NSBezierPath(ovalIn: r.insetBy(dx: 1.5, dy: 1.5))
-            let active = dragging && hoverNode == i
+            let active = dropSess != nil && hoverNode == i
             if reserved.contains(i) && !occupiedHere {
                 ring.setLineDash([3, 2], count: 2, phase: 0)
             }
@@ -219,113 +155,46 @@ final class AssignSectionView: NSView {
             }
         }
 
-        // drag ghost
-        if dragging, let i = pressRow, i < rows.count {
-            let d = rows[i]
+        // drag ghost, once the pointer is over this view
+        if let d = dropSess, let p = dropPoint, bounds.contains(p) {
             IconRenderer.statusDotImage(d, r: 8, canvas: 22, now: now)
-                .draw(in: NSRect(x: dragPoint.x - 11, y: dragPoint.y - 11,
+                .draw(in: NSRect(x: p.x - 11, y: p.y - 11,
                                  width: 22, height: 22))
         }
     }
 
-    // MARK: mouse
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let t = tracking { removeTrackingArea(t) }
-        let t = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways],
-            owner: self, userInfo: nil)
-        addTrackingArea(t)
-        tracking = t
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        let r = rowAt(p)
-        if r != hoverRow {
-            hoverRow = r
-            needsDisplay = true
-        }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        hoverRow = nil
-        needsDisplay = true
-    }
+    // MARK: mouse (node clicks)
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        pressRow = rowAt(p)
-        dragging = false
-        dragPoint = p
-        if pressRow == nil, let n = nodeAt(p) {
-            // The node click cycle, and every step is VISIBLE (clearing a
-            // pin straight to auto-fill refills instantly with a full
-            // fleet — it looked like the click did nothing):
-            //   occupied (pinned or auto) → EMPTY (a real gap in the bar)
-            //   empty (dashed)            → auto-fill again
-            //   free numbered             → no-op
-            var s = Settings.slots
-            let occupiedHere = (slots[safe: n] ?? nil) != nil
-            if s[n] == Settings.emptySlot {
-                s[n] = nil
-            } else if s[n] != nil || occupiedHere {
-                s[n] = Settings.emptySlot
-            } else {
-                return
-            }
-            Settings.slots = s
-            refreshAfterChange()
+        guard let n = nodeAt(p) else { return }
+        // The node click cycle, and every step is VISIBLE (clearing a
+        // pin straight to auto-fill refills instantly with a full
+        // fleet — it looked like the click did nothing):
+        //   occupied (pinned or auto) → EMPTY (a real gap in the bar)
+        //   empty (dashed)            → auto-fill again
+        //   free numbered             → no-op
+        var s = Settings.slots
+        let occupiedHere = (slots[safe: n] ?? nil) != nil
+        if s[n] == Settings.emptySlot {
+            s[n] = nil
+        } else if s[n] != nil || occupiedHere {
+            s[n] = Settings.emptySlot
+        } else {
+            return
         }
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        guard pressRow != nil else { return }
-        let p = convert(event.locationInWindow, from: nil)
-        if !dragging && hypot(p.x - dragPoint.x, p.y - dragPoint.y) > 4 {
-            dragging = true
-        }
-        dragPoint = p
-        hoverNode = nodeAt(p)
-        needsDisplay = true
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        defer {
-            dragging = false
-            pressRow = nil
-            hoverNode = nil
-            needsDisplay = true
-        }
-        let p = convert(event.locationInWindow, from: nil)
-        guard let i = pressRow, i < rows.count else { return }
-        let id = rows[i].sess.id
-        if dragging {
-            guard let n = nodeAt(p) else { return }
-            var s = Settings.slots
-            for j in 0..<s.count where s[j] == id { s[j] = nil }
-            s[n] = id
-            Settings.slots = s
-            refreshAfterChange()
-        } else if rowAt(p) == i {
-            // plain click: show/hide (grid) — the old menu-row behavior
-            var h = Settings.hidden
-            if h.contains(id) { h.remove(id) } else { h.insert(id) }
-            Settings.hidden = h
-            refreshAfterChange()
-        }
-    }
-
-    private func refreshAfterChange() {
-        if let store = storeRef { reload(store: store) }
+        Settings.slots = s
         onChange?()
     }
 
-    /// weak-ish backref so internal changes can re-derive the layout
-    weak var storeOwner: AnyObject?
-    private var storeRef: FleetStore? { storeOwner as? FleetStore }
+    // a row drag whose events land here (the cursor is over the grid)
+    override func mouseDragged(with event: NSEvent) {
+        RowDrag.dragged(to: NSEvent.mouseLocation, nodes: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        RowDrag.up(at: NSEvent.mouseLocation, on: nil, nodes: self)
+    }
 }
 
 extension Array {

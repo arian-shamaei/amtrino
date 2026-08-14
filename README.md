@@ -33,8 +33,10 @@ through terminal panes. amtrino puts the whole fleet in the menu bar:
 Every session as a row (name · project · context %), and the 3×3 node grid
 that **is** the bar icon: drag any session onto a node to pin it to that
 exact spot, click an occupied node to leave a deliberate gap, click a row
-to hide it. The legend at the bottom animates — the "breathing" sample
-actually breathes.
+to hide it. Every session row carries its own submenu (▸) with two more
+verbs: jump to its terminal, or end the session (a confirmed, graceful
+SIGTERM to the agent process). The legend at the bottom animates — the
+"breathing" sample actually breathes.
 
 ## Finished responses find you
 
@@ -45,6 +47,11 @@ notification fires, carrying the session's identity dot. **Click the
 banner and amtrino jumps you to that session's exact tmux pane**, in
 whatever terminal hosts it (found generically by process ancestry — no
 per-terminal integration).
+
+The finish sound is a custom soft chime — a kalimba fifth synthesized by
+[`scripts/make-sounds.py`](scripts/make-sounds.py) — with three soothing
+choices (plus system default and silent) under Options ▸ Notification
+sound, previewed as you pick.
 
 ## Themes are gradients you can edit
 

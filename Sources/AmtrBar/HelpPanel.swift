@@ -6,7 +6,8 @@
 //   2 drag = pin ⌖    a session dot flies onto a node and pins
 //   3 click = gap     clicking an occupied node leaves a real gap
 //   4 click = refill  clicking the dashed node lets auto-fill return
-//   5 dot language    busy / done / stalled / shell / idle, animating
+//   5 row ▸ end       a row's submenu opens; End session… ends the agent
+//   6 dot language    busy / done / stalled / shell / idle, animating
 
 import AppKit
 
@@ -19,7 +20,7 @@ final class HelpView: NSView {
     // auto-advances, arrows jump directly. Scene 0 is the WELCOME page —
     // shown first on every open, and the app opens this window on its
     // very first launch.
-    private let lens: [Double] = [4.5, 5.0, 4.5, 4.0, 3.5, 5.0]
+    private let lens: [Double] = [4.5, 5.0, 4.5, 4.0, 3.5, 5.5, 5.0]
 
     func start() {
         sceneIx = 0
@@ -282,6 +283,99 @@ final class HelpView: NSView {
             pointer(at: NSPoint(x: np.x + 6, y: np.y - 4),
                     pressed: abs(t - clickT) < 0.35)
             caption("click again to auto-fill")
+        case 5:
+            // end a session: hover its row, the submenu opens, End session…
+            let rowRect = NSRect(x: bounds.width * 0.07,
+                                 y: bounds.height * 0.66,
+                                 width: 200, height: 26)
+            let hoverT = 0.9, subT = 1.2, moveT = 2.2, clickT = 3.4
+            let ended = t > clickT + 0.3
+
+            // the session row (dot · name · › chevron)
+            let rowBg = NSBezierPath(roundedRect: rowRect,
+                                     xRadius: 6, yRadius: 6)
+            NSColor.labelColor.withAlphaComponent(
+                t > hoverT && !ended ? 0.12 : 0.05).setFill()
+            rowBg.fill()
+            let rowAlpha: CGFloat = ended ? 0.3 : 1.0
+            IconRenderer.statusDotImage(mk("earth", "busy"), r: 8,
+                                        canvas: 20, now: now)
+                .draw(in: NSRect(x: rowRect.minX + 8, y: rowRect.midY - 10,
+                                 width: 20, height: 20),
+                      from: .zero, operation: .sourceOver, fraction: rowAlpha)
+            ("earth — demo" as NSString).draw(
+                at: NSPoint(x: rowRect.minX + 34, y: rowRect.midY - 8),
+                withAttributes: [
+                    .font: NSFont.menuFont(ofSize: 13),
+                    .foregroundColor: NSColor.labelColor
+                        .withAlphaComponent(rowAlpha)])
+            ("›" as NSString).draw(
+                at: NSPoint(x: rowRect.maxX - 14, y: rowRect.midY - 8),
+                withAttributes: [
+                    .font: NSFont.menuFont(ofSize: 13),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                        .withAlphaComponent(rowAlpha)])
+
+            // the submenu, once hovered
+            var endLine = NSPoint.zero
+            if t > subT && !ended {
+                let sub = NSRect(x: rowRect.maxX + 8, y: rowRect.midY - 62,
+                                 width: 168, height: 70)
+                let subBg = NSBezierPath(roundedRect: sub,
+                                         xRadius: 8, yRadius: 8)
+                NSColor.windowBackgroundColor.setFill()
+                subBg.fill()
+                NSColor.separatorColor.setStroke()
+                subBg.lineWidth = 1
+                subBg.stroke()
+                ("Jump to terminal" as NSString).draw(
+                    at: NSPoint(x: sub.minX + 12, y: sub.maxY - 24),
+                    withAttributes: [
+                        .font: NSFont.menuFont(ofSize: 13),
+                        .foregroundColor: NSColor.labelColor])
+                let sep = NSBezierPath()
+                sep.move(to: NSPoint(x: sub.minX + 6, y: sub.midY))
+                sep.line(to: NSPoint(x: sub.maxX - 6, y: sub.midY))
+                NSColor.separatorColor.setStroke()
+                sep.stroke()
+                let hlOn = t > moveT + 0.6
+                let hlRect = NSRect(x: sub.minX + 5, y: sub.minY + 6,
+                                    width: sub.width - 10, height: 22)
+                if hlOn {
+                    NSColor.controlAccentColor.withAlphaComponent(0.85)
+                        .setFill()
+                    NSBezierPath(roundedRect: hlRect,
+                                 xRadius: 4, yRadius: 4).fill()
+                }
+                ("End session…" as NSString).draw(
+                    at: NSPoint(x: sub.minX + 12, y: sub.minY + 9),
+                    withAttributes: [
+                        .font: NSFont.menuFont(ofSize: 13),
+                        .foregroundColor: hlOn ? NSColor.white
+                                               : NSColor.labelColor])
+                endLine = NSPoint(x: hlRect.midX, y: hlRect.midY)
+            }
+
+            // pointer: fly to the row, then down onto End session…
+            if !ended {
+                let start = NSPoint(x: bounds.width * 0.5,
+                                    y: bounds.height * 0.12)
+                let rowP = NSPoint(x: rowRect.maxX - 24, y: rowRect.midY)
+                let p: NSPoint
+                if t < moveT {
+                    let k = ease(t / hoverT)
+                    p = NSPoint(x: start.x + (rowP.x - start.x) * k,
+                                y: start.y + (rowP.y - start.y) * k)
+                } else {
+                    let target = endLine == .zero ? rowP : endLine
+                    let k = ease((t - moveT) / 0.9)
+                    p = NSPoint(x: rowP.x + (target.x - rowP.x) * k,
+                                y: rowP.y + (target.y - rowP.y) * k)
+                }
+                pointer(at: NSPoint(x: p.x + 6, y: p.y - 4),
+                        pressed: abs(t - clickT) < 0.3)
+            }
+            caption("row ▸ menu ends a session")
         default:
             // the dot language, animating for real
             let styles: [(DisplaySession, String)] = [

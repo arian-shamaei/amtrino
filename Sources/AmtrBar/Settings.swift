@@ -125,6 +125,13 @@ struct Settings {
         set { d.set(newValue, forKey: "notifyOnFinish") }
     }
 
+    /// Finish-sound choice (NotifySound rawValue); default is the soft
+    /// custom chime.
+    static var notifySoundRaw: String {
+        get { d.string(forKey: "notifySound") ?? "calm" }
+        set { d.set(newValue, forKey: "notifySound") }
+    }
+
     /// First-launch flag: the app opens the welcome/help tour once.
     static var hasSeenWelcome: Bool {
         get { d.bool(forKey: "hasSeenWelcome") }

@@ -82,6 +82,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         client.start()
         redraw()
 
+        // stage the custom chimes where UNUserNotifications can find them
+        DispatchQueue.global(qos: .utility).async { NotifySound.install() }
+
         // very first launch: greet with the welcome/help tour (once)
         if !Settings.hasSeenWelcome {
             Settings.hasSeenWelcome = true
@@ -182,14 +185,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard canNotify else {
             // no banner permission: still make the finish audible
             NSLog("%@", "amtrino: finish for \(s.name) — no notification permission, sound fallback")
-            NSSound(named: "Glass")?.play()
+            NotifySound.current.playFallback()
             return
         }
         let content = UNMutableNotificationContent()
         content.title = "\(s.name) finished"
         content.body = s.lastPrompt.map { String($0.prefix(120)) }
             ?? s.projectTail
-        content.sound = .default
+        content.sound = NotifySound.current.unSound
         // clicking the banner jumps to the session (SessionFocus)
         content.userInfo = ["session": s.id, "tmux": s.tmux ?? ""]
         // macOS 26 banners ignore legacy .icns (generic glass tile instead),
@@ -291,41 +294,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
         menu.addItem(.separator())
 
-        // sessions, in GRID ORDER, each carrying a picture of the answer to
-        // "which dot am I": the 3×3 map with this session's dot lit at its
-        // real position. Non-displayed sessions (hidden / overflow / single
-        // mode) follow as lone identity dots. Checkmark = shown in grid;
-        // in single mode selecting a session pins it.
-        let now = Date()
+        // sessions: the 3×3 node grid first (grid mode), then ONE MENU ITEM
+        // PER SESSION — each a custom row view carrying its own native
+        // submenu (▸ jump to terminal / end session). Drag a row onto a
+        // node to pin it; the row view reports the drag to the grid view.
+        var nodesView: AssignSectionView?
         if Settings.mode == .grid {
-            // grid mode: the whole session section is ONE custom view —
-            // every open session as a row, the 9 grid nodes beneath, drag
-            // to pin (standard menu items cannot be dragged)
-            let section = NSMenuItem()
-            let v = AssignSectionView(width: 380)
-            v.storeOwner = store
-            v.onChange = { [weak self] in self?.redraw() }
-            v.reload(store: store)
-            section.view = v
-            menu.addItem(section)
-        } else {
-            // single mode: plain rows, click pins the shown session
-            var nameCount: [String: Int] = [:]
-            for s in rows { nameCount[s.name, default: 0] += 1 }
-            for s in rows {
-                let d = DisplaySession(sess: s, finishedAgo: nil)
-                let fill = s.fill.map { " \(Int(($0 * 100).rounded()))%" } ?? ""
-                let tag = (nameCount[s.name] ?? 0) > 1
-                    ? " [\(s.id.prefix(4))]" : ""
-                let mi = item("\(s.name)\(tag) — \(s.projectTail)\(fill)",
-                              #selector(toggleSession(_:)))
-                mi.representedObject = s.id
-                mi.image = IconRenderer.menuDot(
-                    d, gridIndex: nil, occupied: [], now: now)
-                mi.state = Settings.pinned == s.id ? .on : .off
-                menu.addItem(mi)
-            }
+            let ni = NSMenuItem()
+            let nv = AssignSectionView(width: 380)
+            nv.reload(store: store)
+            ni.view = nv
+            menu.addItem(ni)
+            nodesView = nv
         }
+        var nameCount: [String: Int] = [:]
+        for s in rows { nameCount[s.name, default: 0] += 1 }
+        var rowViews: [SessionRowView] = []
+        for s in rows {
+            let tag = (nameCount[s.name] ?? 0) > 1
+                ? " [\(s.id.prefix(4))]" : ""
+            let mi = NSMenuItem()
+            let rv = SessionRowView(width: 380, sess: s, dupTag: tag,
+                                    single: Settings.mode == .single,
+                                    store: store)
+            rv.nodesView = nodesView
+            mi.view = rv
+            mi.submenu = SessionActions.shared.submenu(for: s)
+            menu.addItem(mi)
+            rowViews.append(rv)
+        }
+        // any change from any view refreshes the bar AND every sibling
+        // view (a pin move changes row badges, node fills, the icon).
+        // The menu's removeAllItems on next open breaks the cycle.
+        let refreshAll: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.redraw()
+            self.retimer()
+            nodesView?.reload(store: self.store)
+            for rv in rowViews { rv.refresh(store: self.store) }
+        }
+        nodesView?.onChange = refreshAll
+        for rv in rowViews { rv.onChange = refreshAll }
         if Settings.mode == .single {
             let auto = item("Auto (busiest)", #selector(pinAuto))
             auto.state = Settings.pinned == nil ? .on : .off
@@ -388,6 +397,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let notify = item("Notify when a response finishes", #selector(toggleNotify))
         notify.state = Settings.notifyOnFinish ? .on : .off
         opts.addItem(notify)
+        let sound = NSMenuItem(title: "Notification sound", action: nil,
+                               keyEquivalent: "")
+        let soundMenu = NSMenu()
+        for s in NotifySound.allCases {
+            if s == .system { soundMenu.addItem(.separator()) }
+            let mi = item(s.label, #selector(setNotifySound(_:)))
+            mi.representedObject = s.rawValue
+            mi.state = NotifySound.current == s ? .on : .off
+            soundMenu.addItem(mi)
+        }
+        sound.submenu = soundMenu
+        opts.addItem(sound)
         if Settings.notifyOnFinish && notifyDenied {
             // permission is off at the OS level — say so instead of failing
             // silently, and hand the user the fix
@@ -467,6 +488,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     @objc private func pinAuto() { Settings.pinned = nil; redraw() }
     @objc private func toggleNotify() { Settings.notifyOnFinish.toggle() }
 
+    @objc private func setNotifySound(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let s = NotifySound(rawValue: raw) else { return }
+        NotifySound.current = s
+        s.preview()   // hear the choice immediately
+    }
+
     @objc private func openNotifySettings() {
         if let url = URL(string:
             "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
@@ -489,16 +517,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
-    @objc private func toggleSession(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        if Settings.mode == .single {
-            Settings.pinned = id
-        } else {
-            var h = Settings.hidden
-            if h.contains(id) { h.remove(id) } else { h.insert(id) }
-            Settings.hidden = h
-        }
-        redraw()
-        retimer()
-    }
 }

@@ -34,7 +34,9 @@ func import_notify_test() -> Never {
             let content = UNMutableNotificationContent()
             content.title = "amtrino test"
             content.body = "notifications are working"
-            content.sound = .default
+            // the real finish path's sound, so the probe also proves the
+            // custom chime resolves
+            content.sound = NotifySound.current.unSound ?? .default
             // same identity-dot attachment the real finish banner carries
             if let sess = FleetSession(json: ["id": "notify-test",
                                               "status": "idle", "live": true,

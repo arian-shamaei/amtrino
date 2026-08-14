@@ -10,7 +10,8 @@ let package = Package(
         .executableTarget(
             name: "AmtrBar",
             path: "Sources/AmtrBar",
-            resources: [.copy("Resources/amtr_engine.py")]
+            resources: [.copy("Resources/amtr_engine.py"),
+                        .copy("Resources/Sounds")]
         ),
     ]
 )
