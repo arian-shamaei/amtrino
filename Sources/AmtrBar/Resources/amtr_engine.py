@@ -15,7 +15,7 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 _PROTO = os.fdopen(_PROTO_FD, "w", buffering=1, encoding="utf-8")
 
-import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess, signal
+import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess, signal, hashlib
 from collections import deque
 from datetime import datetime, timezone
 
@@ -480,6 +480,721 @@ def _fresh_pending():
             "compactions": [], "events": [], "agents": set(), "logs": [],
             "cmds": [], "rets": [], "map_rebuild": False}
 
+# ---------------------------------------------------------------- providers
+# Codex CLI and Gemini CLI transcripts → the engine's record model. Each
+# adapter is a stateful, deep-copyable translator: one raw transcript line in,
+# zero or more CLAUDE-SHAPED records out (user / assistant / system
+# compact_boundary / provider_meta), which Session.feed_obj digests exactly as
+# it does a Claude Code transcript. That is the whole design: one accounting
+# core (turns, ring, files, cache economics, compactions, agents, replay,
+# report), three front formats. Anything a provider cannot say (Codex has no
+# cache-write tier; Gemini has no compaction pre/post sizes) is left absent
+# and stays labeled estimated downstream — never invented.
+#
+#   provider  transcript                                          turn = 1 API request
+#   claude    ~/.claude/projects/<slug>/<sid>.jsonl               requestId
+#   codex     ~/.codex/sessions/Y/M/D/rollout-<ts>-<id>.jsonl     one event_msg token_count
+#   gemini    ~/.gemini/tmp/<proj>/chats/session-<ts>-<id8>.jsonl one `gemini` message
+#
+# Turn ordering law (both adapters): the usage record OPENS the turn first,
+# then the response's content records (own uuids — compaction survivors are
+# matched by uuid), then the tool_result records. Content is therefore held
+# until the request's usage is known (Codex: the token_count that follows the
+# tool outputs; Gemini: tokens ride on the message itself), so a turn's
+# allocations always land in the turn that paid for them.
+
+def detect_provider(path, first_line=None):
+    """Which CLI wrote this transcript. Path first (cheap, exact for the two
+    known layouts), then the first line's shape."""
+    p = path or ""
+    if "/.codex/" in p or os.path.basename(p).startswith("rollout-"):
+        return "codex"
+    if "/.gemini/" in p and os.path.basename(p).startswith("session-"):
+        return "gemini"
+    if first_line is None:
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                first_line = fh.readline()
+        except OSError:
+            first_line = ""
+    try:
+        d = json.loads(first_line or "{}")
+    except Exception:
+        d = {}
+    if isinstance(d, dict):
+        if d.get("type") == "session_meta" and isinstance(d.get("payload"), dict):
+            return "codex"
+        if isinstance(d.get("sessionId"), str) and isinstance(d.get("projectHash"), str) \
+                and "type" not in d:
+            return "gemini"
+    return "claude"
+
+
+_CODEX_INJECTED = ("# AGENTS.md", "<environment_context>", "<turn_aborted>",
+                   "<permissions", "<skills_instructions>", "<multi_agent_mode>",
+                   "<user_instructions>", "<INSTRUCTIONS>")
+
+
+def codex_user_text(payload):
+    """The human's text in a Codex response_item message role:user — None
+    when the record is the harness's own injected context (AGENTS.md,
+    environment, permissions…), which also arrives as role:user."""
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return None
+    text = "\n".join(
+        c.get("text") or "" for c in (payload.get("content") or [])
+        if isinstance(c, dict) and isinstance(c.get("text"), str))
+    if text.lstrip().startswith(_CODEX_INJECTED):
+        return None
+    return text
+
+
+def _shell_ok_from_output(out):
+    """Codex/Gemini put the exit status inside the tool output text."""
+    m = re.search(r"(?:Process exited with code|Exit [Cc]ode:?)\s*(-?\d+)", out or "")
+    return (m is None) or m.group(1) == "0"
+
+
+def _codex_output_body(out):
+    """The stdout part of a Codex exec_command output ("Chunk ID…\nOutput:\n…")."""
+    if not isinstance(out, str):
+        return ""
+    i = out.find("Output:\n")
+    return out[i + 8:] if i >= 0 else out
+
+
+def _norm_blocks(o):
+    """Tool output → tool_result content the estimator prices honestly: text
+    stays text, images (base64 payloads that are NOT tokens) become the
+    engine's flat-priced image block, anything else is JSON."""
+    if o is None:
+        return ""
+    if isinstance(o, str):
+        return o
+    if isinstance(o, dict):
+        o = [o]
+    if isinstance(o, list):
+        blocks = []
+        for b in o:
+            if isinstance(b, dict):
+                bt = b.get("type") or ""
+                if bt in ("input_image", "image", "output_image") or \
+                        isinstance(b.get("inlineData"), dict) or \
+                        isinstance(b.get("image_url"), str):
+                    blocks.append({"type": "image"})
+                    continue
+                if isinstance(b.get("text"), str):
+                    blocks.append({"type": "text", "text": b["text"]})
+                    continue
+                blocks.append({"type": "text", "text": json.dumps(b)})
+            elif isinstance(b, str):
+                blocks.append({"type": "text", "text": b})
+            else:
+                blocks.append({"type": "text", "text": json.dumps(b)})
+        return blocks
+    return json.dumps(o)
+
+
+_PATCH_FILE_RE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$", re.M)
+
+
+def _codex_patch_files(text):
+    """(op, path) per file in an apply_patch input; op ∈ w (add) · e (update)
+    · d (delete)."""
+    out = []
+    for m in _PATCH_FILE_RE.finditer(text or ""):
+        op = {"Add": "w", "Update": "e", "Delete": "d"}[m.group(1)]
+        out.append((op, m.group(2).strip()))
+    return out
+
+
+class CodexAdapter:
+    """Codex CLI rollout → records. Buffers a request's response_items until
+    its token_count arrives (see the ordering law), then emits usage → content
+    → tool results. Every field is plain data so Session.clone() deep-copies
+    the adapter with the checkpoint (replay resumes mid-stream)."""
+    provider = "codex"
+
+    def __init__(self):
+        self.req_n = 0             # requests seen (turn counter)
+        self.items = []            # buffered content records for the open request
+        self.results = []          # buffered tool_result records
+        self.last_usage = None     # last token_count usage (dedupe refreshes)
+        self.model = ""
+        self.budget = None
+        self.tools = {}            # call_id -> (mapped name, file paths, kind)
+        self.meta_sent = False
+        self.agents = {}           # thread id -> agent_path
+
+    # -- helpers ------------------------------------------------------------
+    def _req_id(self, offset=0):
+        return "cx-req-%d" % (self.req_n + offset)
+
+    @staticmethod
+    def _rec(kind, uuid, ts, **kw):
+        d = {"type": kind, "uuid": uuid, "timestamp": ts}
+        d.update(kw)
+        return d
+
+    def _assistant(self, uuid, ts, blocks, usage=None, req=None):
+        msg = {"role": "assistant", "model": self.model, "content": blocks}
+        if usage is not None:
+            msg["usage"] = usage
+        return self._rec("assistant", uuid, ts, requestId=req or self._req_id(1),
+                         message=msg)
+
+    def _tool_result_rec(self, uuid, ts, call_id, out, ok, tur=None):
+        b = {"type": "tool_result", "tool_use_id": call_id,
+             "content": _norm_blocks(out)}
+        if not ok:
+            b["is_error"] = True
+        d = self._rec("user", uuid, ts,
+                      message={"role": "user", "content": [b]})
+        if tur is not None:
+            d["toolUseResult"] = tur
+        return d
+
+    def _map_call(self, name, args_raw, call_id):
+        """Codex tool → the engine's tool vocabulary; returns tool_use blocks
+        (apply_patch fans out per file) and remembers the mapping."""
+        args = args_raw
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw)
+            except Exception:
+                args = {"raw": args_raw}
+        if not isinstance(args, dict):
+            args = {"raw": args}
+        if name in ("exec_command", "shell", "shell_command", "local_shell"):
+            cmd = args.get("cmd") or args.get("command")
+            if isinstance(cmd, list):
+                cmd = " ".join(str(c) for c in cmd)
+            self.tools[call_id] = ("Bash", [], "cmd")
+            return [{"type": "tool_use", "id": call_id, "name": "Bash",
+                     "input": {"command": cmd or "", "workdir": args.get("workdir")}}]
+        if name == "apply_patch":
+            files = _codex_patch_files(args.get("raw") if "raw" in args
+                                       else args.get("input") or args.get("patch") or "")
+            blocks = []
+            paths = []
+            for i, (op, fp) in enumerate(files):
+                if op == "d":
+                    continue
+                tool = "Write" if op == "w" else "Edit"
+                bid = call_id if not blocks else "%s#%d" % (call_id, i)
+                blocks.append({"type": "tool_use", "id": bid, "name": tool,
+                               "input": {"file_path": fp,
+                                         "patch": args.get("raw") or ""}})
+                paths.append(fp)
+            if not blocks:
+                blocks = [{"type": "tool_use", "id": call_id, "name": "apply_patch",
+                           "input": args}]
+            self.tools[call_id] = ("Edit", paths, "patch")
+            return blocks
+        if name in ("web_search", "web_search_call"):
+            self.tools[call_id] = ("WebSearch", [], "ret")
+            return [{"type": "tool_use", "id": call_id, "name": "WebSearch",
+                     "input": {"query": args.get("query") or args.get("q") or ""}}]
+        if name in ("spawn_agent", "spawn_agents", "run_agent"):
+            self.tools[call_id] = ("Task", [], "agent")
+            return [{"type": "tool_use", "id": call_id, "name": "Task",
+                     "input": {"description": args.get("agent_path")
+                               or args.get("name") or name}}]
+        self.tools[call_id] = (name, [], "tool")
+        return [{"type": "tool_use", "id": call_id, "name": name, "input": args}]
+
+    # -- the translator ------------------------------------------------------
+    def translate(self, d):
+        t = d.get("type")
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        ts = d.get("timestamp") or ""
+        out = []
+        if t == "session_meta":
+            self.model = p.get("model") or self.model
+            src = p.get("source")
+            sub = p.get("thread_source") == "subagent" or (
+                isinstance(src, dict) and "subagent" in src)
+            out.append({"type": "provider_meta", "provider": "codex",
+                        "sessionId": p.get("id") or p.get("session_id"),
+                        "timestamp": p.get("timestamp") or ts,
+                        "version": p.get("cli_version"), "cwd": p.get("cwd"),
+                        "subagent": bool(sub),
+                        "title": (p.get("agent_nickname") or p.get("agent_path"))
+                        if sub else None})
+            self.meta_sent = True
+            return out
+        if t == "turn_context":
+            m = p.get("model")
+            if isinstance(m, str) and m:
+                self.model = m
+            return out
+        if t == "response_item":
+            pt = p.get("type")
+            iid = p.get("id") or ("cx-item-%d" % (len(self.items) + 1))
+            if pt == "message":
+                role = p.get("role")
+                text = "\n".join(
+                    c.get("text") or "" for c in (p.get("content") or [])
+                    if isinstance(c, dict) and isinstance(c.get("text"), str))
+                if role == "user":
+                    # user prompts and Codex's own injected context (AGENTS.md,
+                    # environment) both arrive as role:user; the injected ones
+                    # are the harness talking, not the human — attach
+                    if codex_user_text(p) is None:
+                        out.append(self._rec("attachment", iid, ts,
+                                             attachment={"type": "codex_context",
+                                                         "text": text}))
+                    else:
+                        out.append(self._rec("user", iid, ts, message={
+                            "role": "user",
+                            "content": [{"type": "text", "text": text}]}))
+                elif role == "developer" or role == "system":
+                    out.append(self._rec("attachment", iid, ts,
+                                         attachment={"type": "codex_developer",
+                                                     "text": text}))
+                elif role == "assistant":
+                    self.items.append(self._assistant(
+                        iid, ts, [{"type": "text", "text": text}]))
+            elif pt == "reasoning":
+                # summaries are the only visible reasoning; the encrypted body
+                # is resident too but its size is only knowable through usage
+                # (hidden reasoning = out − visible, the Claude rule)
+                summ = "\n".join(
+                    c.get("text") or "" for c in (p.get("summary") or [])
+                    if isinstance(c, dict) and isinstance(c.get("text"), str))
+                if summ:
+                    self.items.append(self._assistant(
+                        iid, ts, [{"type": "thinking", "thinking": summ}]))
+            elif pt in ("function_call", "custom_tool_call"):
+                cid = p.get("call_id") or iid
+                raw = p.get("arguments") if pt == "function_call" else p.get("input")
+                blocks = self._map_call(p.get("name") or "?", raw, cid)
+                self.items.append(self._assistant(iid, ts, blocks))
+            elif pt in ("function_call_output", "custom_tool_call_output"):
+                cid = p.get("call_id") or ""
+                outp = p.get("output")
+                name, paths, kind = self.tools.get(cid, ("?", [], "tool"))
+                text = outp if isinstance(outp, str) else ""
+                ok = _shell_ok_from_output(text)
+                tur = None
+                if kind == "cmd":
+                    tur = {"stdout": _codex_output_body(text), "stderr": "",
+                           "interrupted": "interrupted" in text[:200].lower()}
+                self.results.append(self._tool_result_rec(iid, ts, cid, outp, ok, tur))
+                if kind == "patch" and len(paths) > 1:
+                    # the fan-out ids share one output; the extras get an
+                    # empty ack so their file segments still resolve
+                    for i in range(1, len(paths)):
+                        self.results.append(self._tool_result_rec(
+                            "%s#%d" % (iid, i), ts, "%s#%d" % (cid, i), "", True))
+            elif pt == "agent_message":
+                # inter-agent mail: resident context, harness-injected
+                text = "\n".join(
+                    c.get("text") or "" for c in (p.get("content") or [])
+                    if isinstance(c, dict) and isinstance(c.get("text"), str))
+                out.append(self._rec("attachment", iid, ts,
+                                     attachment={"type": "agent_message",
+                                                 "text": text}))
+            return out
+        if t == "event_msg":
+            pt = p.get("type")
+            if pt == "task_started":
+                w = p.get("model_context_window")
+                if isinstance(w, int) and w > 0 and w != self.budget:
+                    self.budget = w
+                    out.append({"type": "provider_meta", "provider": "codex",
+                                "budget": w})
+                return out
+            if pt == "token_count":
+                info = p.get("info") if isinstance(p.get("info"), dict) else {}
+                last = info.get("last_token_usage") \
+                    if isinstance(info.get("last_token_usage"), dict) else None
+                w = info.get("model_context_window")
+                if isinstance(w, int) and w > 0 and w != self.budget:
+                    self.budget = w
+                    out.append({"type": "provider_meta", "provider": "codex",
+                                "budget": w})
+                if last is None:
+                    return out
+                key = (last.get("input_tokens"), last.get("cached_input_tokens"),
+                       last.get("output_tokens"), last.get("cache_write_input_tokens"))
+                if key == self.last_usage and not self.items and not self.results:
+                    return out           # a rate-limit refresh, not a request
+                self.last_usage = key
+                self.req_n += 1
+                inp = _i(last.get("input_tokens"))
+                cached = min(_i(last.get("cached_input_tokens")), inp)
+                usage = {"input_tokens": inp - cached,
+                         "cache_read_input_tokens": cached,
+                         "cache_creation_input_tokens": _i(last.get("cache_write_input_tokens")),
+                         "output_tokens": _i(last.get("output_tokens"))}
+                out.append(self._assistant(self._req_id(), ts, [], usage=usage,
+                                           req=self._req_id()))
+                for it in self.items:
+                    it["requestId"] = self._req_id()
+                    out.append(it)
+                out.extend(self.results)
+                self.items, self.results = [], []
+                return out
+            if pt in ("task_complete", "turn_aborted"):
+                # a request that ended without a token_count (aborted, or the
+                # final assistant message that came after the last count):
+                # its content still landed in context — allocate it under
+                # the last request
+                if self.items or self.results:
+                    for it in self.items:
+                        it["requestId"] = self._req_id() if self.req_n else "cx-req-1"
+                        out.append(it)
+                    out.extend(self.results)
+                    self.items, self.results = [], []
+                if pt == "turn_aborted":
+                    out.append({"type": "provider_event", "kind": "interrupt",
+                                "severity": "info", "timestamp": ts,
+                                "msg": "turn aborted"})
+                return out
+            if pt == "sub_agent_activity":
+                aid = p.get("agent_thread_id") or ""
+                kind = p.get("kind")
+                path = p.get("agent_path") or aid[:8]
+                if not aid:
+                    return out
+                if kind == "started" and aid not in self.agents:
+                    self.agents[aid] = path
+                    cid = "cx-ag-" + aid
+                    self.tools[cid] = ("Task", [], "agent")
+                    self.items.append(self._assistant(
+                        "cx-agl-" + aid, ts,
+                        [{"type": "tool_use", "id": cid, "name": "Task",
+                          "input": {"description": path}}]))
+                    self.results.append(self._tool_result_rec(
+                        "cx-agr-" + aid, ts, cid, "", True,
+                        tur={"agentId": aid, "description": path,
+                             "agentType": os.path.basename(path.rstrip("/"))
+                             or "codex"}))
+                elif kind == "interrupted" and aid in self.agents:
+                    self.results.append(self._tool_result_rec(
+                        "cx-agx-" + aid, ts, "cx-ag-" + aid, "interrupted", False,
+                        tur={"agentId": aid, "status": "completed",
+                             "description": self.agents[aid]}))
+                return out
+            if pt == "web_search_end":
+                cid = p.get("call_id") or ("cx-ws-%d" % self.req_n)
+                q = p.get("query") or ""
+                res = p.get("results") if isinstance(p.get("results"), list) else []
+                self.tools[cid] = ("WebSearch", [], "ret")
+                self.items.append(self._assistant(
+                    "cx-wsl-" + cid, ts,
+                    [{"type": "tool_use", "id": cid, "name": "WebSearch",
+                      "input": {"query": q}}]))
+                text = "\n".join(
+                    (r.get("title") or r.get("url") or r.get("domain") or "")
+                    for r in res if isinstance(r, dict))
+                self.results.append(self._tool_result_rec(
+                    "cx-wsr-" + cid, ts, cid, text, True,
+                    tur={"searchCount": len(res)}))
+                return out
+            if pt == "context_compacted":
+                return out       # the `compacted` record carries the data
+            return out
+        if t == "compacted":
+            hist = p.get("replacement_history")
+            hist = hist if isinstance(hist, list) else []
+            keep = [h.get("id") for h in hist if isinstance(h, dict) and h.get("id")]
+            post_tok, _ = est_pair([h.get("content") for h in hist
+                                    if isinstance(h, dict)])
+            out.append({"type": "system", "subtype": "compact_boundary",
+                        "uuid": "cx-compact-%d" % self.req_n, "timestamp": ts,
+                        "compactMetadata": {"trigger": "auto",
+                                            "preTokens": 0,   # engine fills R
+                                            "postTokens": int(post_tok),
+                                            "preservedMessages": {"allUuids": keep}}})
+            return out
+        return out
+
+
+def gemini_token_limit(model):
+    """The CLI's own tokenLimit(): 1,048,576 for every Gemini model it ships,
+    256k for Gemma 4 — the context window IS the budget."""
+    m = (model or "").lower()
+    if m.startswith("gemma-4"):
+        return 256_000
+    return 1_048_576
+
+
+def _gemini_parts_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text") or "" for p in content
+                         if isinstance(p, dict) and isinstance(p.get("text"), str)
+                         and not p.get("thought"))
+    return ""
+
+
+def _gemini_fr_text(result):
+    """The text of a toolCall.result (functionResponse parts). Binary parts
+    (inlineData images) become the literal marker "[image]" — callers price
+    images through _norm_blocks, not through this text."""
+    if isinstance(result, str):
+        return result
+    texts = []
+    for part in result if isinstance(result, list) else [result]:
+        if not isinstance(part, dict):
+            continue
+        if isinstance(part.get("inlineData"), dict):
+            texts.append("[image]")
+            continue
+        fr = part.get("functionResponse")
+        if isinstance(fr, dict):
+            resp = fr.get("response")
+            if isinstance(resp, dict):
+                for k in ("output", "content", "result", "error"):
+                    v = resp.get(k)
+                    if isinstance(v, str):
+                        texts.append(v)
+                        break
+                else:
+                    texts.append(json.dumps(resp))
+            elif isinstance(resp, str):
+                texts.append(resp)
+        elif isinstance(part.get("text"), str):
+            texts.append(part["text"])
+    return "\n".join(texts)
+
+
+class GeminiAdapter:
+    """Gemini CLI session recording → records. The file is an upsert log:
+    a message may be re-appended with more fields (tokens, more toolCalls),
+    `$set` patches metadata (and `$set.messages` REPLACES the history — the
+    compaction), `$rewindTo` truncates. The adapter emits only the delta each
+    time a message reappears."""
+    provider = "gemini"
+    _FILE_TOOLS = {"read_file": "Read", "read_many_files": "Read",
+                   "write_file": "Write", "replace": "Edit", "edit": "Edit"}
+    _SHELL_TOOLS = ("run_shell_command", "shell", "execute_command")
+    _RET_TOOLS = {"google_web_search": "WebSearch", "web_search": "WebSearch",
+                  "web_fetch": "WebFetch"}
+
+    def __init__(self):
+        self.seen = {}          # msg id -> {"text": bool, "tools": set(), "usage": bool}
+        self.order = []         # message ids in history order (rewind law)
+        self.model = ""
+        self.budget = None
+        self.session_id = None
+        self.meta_sent = False
+        self.hold = None        # a gemini message waiting for tokens (id, rec)
+        self.n_compact = 0
+
+    @staticmethod
+    def _rec(kind, uuid, ts, **kw):
+        d = {"type": kind, "uuid": uuid, "timestamp": ts}
+        d.update(kw)
+        return d
+
+    def _tool_block(self, tc):
+        name = tc.get("name") or "?"
+        args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+        cid = tc.get("id") or ""
+        if name in self._FILE_TOOLS:
+            fp = args.get("file_path") or args.get("absolute_path") or args.get("path")
+            inp = dict(args)
+            if isinstance(fp, str):
+                inp["file_path"] = fp
+            return {"type": "tool_use", "id": cid, "name": self._FILE_TOOLS[name],
+                    "input": inp}, "file"
+        if name in self._SHELL_TOOLS:
+            return {"type": "tool_use", "id": cid, "name": "Bash",
+                    "input": {"command": args.get("command") or "",
+                              "description": args.get("description")}}, "cmd"
+        if name in self._RET_TOOLS:
+            mapped = self._RET_TOOLS[name]
+            inp = {"query": args.get("query") or ""} if mapped == "WebSearch" \
+                else {"url": args.get("url") or args.get("prompt") or ""}
+            return {"type": "tool_use", "id": cid, "name": mapped, "input": inp}, "ret"
+        if tc.get("agentId") or name in ("subagent", "run_subagent", "delegate"):
+            return {"type": "tool_use", "id": cid, "name": "Task",
+                    "input": {"description": args.get("description")
+                              or args.get("prompt") or name}}, "agent"
+        return {"type": "tool_use", "id": cid, "name": name, "input": args}, "tool"
+
+    def _emit_message(self, m, ts, out):
+        mid = m.get("id")
+        mtype = m.get("type")
+        st = self.seen.get(mid)
+        if st is None:
+            st = {"text": False, "tools": set(), "usage": False}
+            self.seen[mid] = st
+            self.order.append(mid)
+        if mtype == "user":
+            if not st["text"]:
+                st["text"] = True
+                text = _gemini_parts_text(m.get("content"))
+                # binary/info/context injections vs the human's prompt: the
+                # CLI marks nothing, so a leading @-file/context header is
+                # the only tell — keep it simple: everything is `user`
+                out.append(self._rec("user", mid, ts, message={
+                    "role": "user", "content": [{"type": "text", "text": text}]}))
+            return
+        if mtype in ("info", "error", "warning"):
+            if not st["text"]:
+                st["text"] = True
+                out.append(self._rec("attachment", mid, ts, attachment={
+                    "type": "gemini_" + mtype,
+                    "text": _gemini_parts_text(m.get("content"))}))
+            return
+        if mtype != "gemini":
+            return
+        model = m.get("model") or self.model
+        if model and model != self.model:
+            self.model = model
+            lim = gemini_token_limit(model)
+            if lim != self.budget:
+                self.budget = lim
+                out.append({"type": "provider_meta", "provider": "gemini",
+                            "budget": lim})
+        tokens = m.get("tokens") if isinstance(m.get("tokens"), dict) else None
+        blocks = []
+        if not st["text"]:
+            st["text"] = True
+            text = _gemini_parts_text(m.get("content"))
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for th in m.get("thoughts") or []:
+                if isinstance(th, dict):
+                    tt = " ".join(x for x in (th.get("subject"), th.get("description"))
+                                  if isinstance(x, str))
+                    if tt:
+                        blocks.append({"type": "thinking", "thinking": tt})
+        results = []
+        for tc in m.get("toolCalls") or []:
+            if not isinstance(tc, dict):
+                continue
+            cid = tc.get("id") or ""
+            if cid in st["tools"]:
+                continue
+            status = tc.get("status")
+            # emit a call only once it has finished (its result rides along)
+            if status not in ("success", "error", "cancelled", None) and \
+                    tc.get("result") is None:
+                continue
+            st["tools"].add(cid)
+            blk, kind = self._tool_block(tc)
+            blocks.append(blk)
+            rtext = _gemini_fr_text(tc.get("result"))
+            ok = status != "error" and (kind != "cmd" or _shell_ok_from_output(rtext))
+            tur = None
+            if kind == "cmd":
+                body = rtext
+                mm = re.search(r"\nOutput:\s*\n?(.*?)(?:\nExit Code:|\Z)", rtext, re.S)
+                if mm:
+                    body = mm.group(1)
+                tur = {"stdout": body, "stderr": "", "interrupted": status == "cancelled"}
+            elif kind == "file" and blk["name"] == "Read":
+                tur = {"file": {"content": rtext}}
+            elif kind == "agent":
+                tur = {"agentId": tc.get("agentId") or cid,
+                       "status": "completed" if status in ("success", "error") else None,
+                       "description": (tc.get("args") or {}).get("description")
+                       if isinstance(tc.get("args"), dict) else None,
+                       "content": rtext}
+            elif kind == "ret":
+                tur = {"searchCount": None}
+            n_img = sum(1 for part in (tc.get("result") or [])
+                        if isinstance(part, dict) and isinstance(part.get("inlineData"), dict))
+            content = rtext if not n_img else \
+                [{"type": "text", "text": rtext}] + [{"type": "image"}] * n_img
+            b = {"type": "tool_result", "tool_use_id": cid, "content": content}
+            if not ok:
+                b["is_error"] = True
+            rd = self._rec("user", "%s#r%s" % (mid, cid[-8:]), ts,
+                           message={"role": "user", "content": [b]})
+            if tur is not None:
+                rd["toolUseResult"] = tur
+            results.append(rd)
+        usage = None
+        if tokens is not None and not st["usage"]:
+            st["usage"] = True
+            inp = _i(tokens.get("input"))
+            cached = min(_i(tokens.get("cached")), inp)
+            usage = {"input_tokens": inp - cached,
+                     "cache_read_input_tokens": cached,
+                     "cache_creation_input_tokens": 0,
+                     "output_tokens": _i(tokens.get("output")) + _i(tokens.get("thoughts"))}
+        if usage is None and not blocks and not results:
+            return
+        msg = {"role": "assistant", "model": model, "content": blocks}
+        if usage is not None:
+            msg["usage"] = usage
+        out.append(self._rec("assistant", mid, ts, requestId=mid, message=msg))
+        out.extend(results)
+
+    def _compact(self, ts, keep, trigger="auto"):
+        self.n_compact += 1
+        return {"type": "system", "subtype": "compact_boundary",
+                "uuid": "gm-compact-%d" % self.n_compact, "timestamp": ts,
+                "compactMetadata": {"trigger": trigger, "preTokens": 0,
+                                    "postTokens": 0,
+                                    "preservedMessages": {"allUuids": list(keep)}}}
+
+    def translate(self, d):
+        out = []
+        ts = d.get("timestamp") or d.get("lastUpdated") or d.get("startTime") or ""
+        if isinstance(d.get("$rewindTo"), str):
+            rid = d["$rewindTo"]
+            keep = []
+            for mid in self.order:
+                if mid == rid:
+                    break
+                keep.append(mid)
+            self.order = keep
+            for mid in list(self.seen):
+                if mid not in keep:
+                    self.seen.pop(mid, None)
+            out.append(self._compact(ts, keep, trigger="manual"))
+            return out
+        if isinstance(d.get("$set"), dict):
+            st = d["$set"]
+            if isinstance(st.get("messages"), list):
+                # history REPLACED (chat compression): everything not in the
+                # new set is gone; new synthetic entries (the summary) follow
+                new_ids = [m.get("id") for m in st["messages"]
+                           if isinstance(m, dict) and m.get("id")]
+                keep = [i for i in new_ids if i in self.seen]
+                for mid in list(self.seen):
+                    if mid not in new_ids:
+                        self.seen.pop(mid, None)
+                self.order = [i for i in self.order if i in new_ids]
+                out.append(self._compact(ts, keep))
+                for m in st["messages"]:
+                    if isinstance(m, dict) and m.get("id"):
+                        self._emit_message(m, m.get("timestamp") or ts, out)
+            if isinstance(st.get("summary"), str) and st["summary"]:
+                out.append({"type": "custom-title", "customTitle": st["summary"][:120]})
+            if isinstance(st.get("sessionId"), str) and not self.session_id:
+                self.session_id = st["sessionId"]
+            return out
+        if isinstance(d.get("id"), str) and "type" in d:
+            self._emit_message(d, d.get("timestamp") or ts, out)
+            return out
+        if isinstance(d.get("sessionId"), str) and isinstance(d.get("projectHash"), str):
+            self.session_id = d["sessionId"]
+            dirs = d.get("directories") if isinstance(d.get("directories"), list) else []
+            out.append({"type": "provider_meta", "provider": "gemini",
+                        "sessionId": d["sessionId"],
+                        "timestamp": d.get("startTime") or ts,
+                        "cwd": dirs[0] if dirs and isinstance(dirs[0], str) else None,
+                        "projectHash": d.get("projectHash"),
+                        "subagent": d.get("kind") == "subagent",
+                        "title": d.get("summary")})
+            self.meta_sent = True
+            return out
+        return out
+
+
+def make_adapter(provider):
+    return {"codex": CodexAdapter, "gemini": GeminiAdapter}.get(provider, lambda: None)()
+
+
 # ---------------------------------------------------------------- session
 class Session:
     """Pure accounting for one transcript. No I/O emission of its own —
@@ -488,11 +1203,16 @@ class Session:
     _SKIP_CLONE = ("checkpoints", "rec_offsets", "pending", "_no_ckpt")
 
     def __init__(self, path, budget=None, budget_pinned=False, t_auto=0.85,
-                 ckpt_every=200, sidechain_ok=False):
+                 ckpt_every=200, sidechain_ok=False, provider=None):
         # an explicitly attached agent transcript IS the main conversation
         # from this Session's point of view (SPEC c `attach`)
         self.sidechain_ok = sidechain_ok
         self.path = path
+        # which CLI wrote the transcript; non-Claude providers feed through a
+        # translating adapter (see the providers section) — plain data, so
+        # clone() carries it into checkpoints and replay resumes mid-stream
+        self.provider = provider or detect_provider(path)
+        self.adapter = make_adapter(self.provider)
         self.session_id = os.path.basename(path)[:-6] if path.endswith(".jsonl") \
             else os.path.basename(path)
         # authoritative per-turn ledger
@@ -537,11 +1257,17 @@ class Session:
         self.rebase_pending = False
         self.alpha = 1.0
         self.overhead = 0
+        # between a compact_boundary and the next usage record turns[-1]
+        # still holds the PRE-cut R; the boundary's post size is the honest
+        # interim resident for map sizing (cleared at the next usage)
+        self.interim_R = None
         # config / meta
         self.budget = budget if budget else BUDGET_RUNGS[0]
         self.budget_pinned = budget_pinned
+        self.provider_budget = False    # a provider adapter set the window
         self.t_auto = t_auto
         self.model = ""
+        self.backend = None    # local-backend identity (§ backend probe)
         self.cc_version = None
         self.started_at = None
         self.started_epoch = 0.0
@@ -568,6 +1294,7 @@ class Session:
         self._sig_turn = -1      # last turn index the thrash signals ran for
         self._sid_seen = False
         self.zone = 0
+        self._trunc_warned = False
         # map
         self.map_rev = 0
         self.map_base_n = 0      # segs in the last coalesced map emission
@@ -625,14 +1352,26 @@ class Session:
             return
         self.rec_offsets.append(offset)
         self.rec_count += 1
-        u = d.get("uuid")
-        if isinstance(u, str) and u not in self.uuid_order:
-            self.uuid_order[u] = self.rec_count
-        try:
-            self.feed_obj(d)
-        except Exception as e:
-            self.pending["logs"].append("record parse error: %s" % e)
+        for rec in self.translate(d):
+            u = rec.get("uuid")
+            if isinstance(u, str) and u not in self.uuid_order:
+                self.uuid_order[u] = self.rec_count
+            try:
+                self.feed_obj(rec)
+            except Exception as e:
+                self.pending["logs"].append("record parse error: %s" % e)
         self._maybe_checkpoint()
+
+    def translate(self, d):
+        """Raw transcript object → the records feed_obj digests: identity
+        for Claude Code, the provider adapter's output otherwise."""
+        if self.adapter is None:
+            return [d]
+        try:
+            return self.adapter.translate(d)
+        except Exception as e:
+            self.pending["logs"].append("%s adapter error: %s" % (self.provider, e))
+            return []
 
     def is_new_turn(self, d):
         """Would this record open a new turn? Must mirror _feed_assistant."""
@@ -643,13 +1382,14 @@ class Session:
         m = d.get("message")
         if not isinstance(m, dict):
             return False
-        if (m.get("model") or "") == "<synthetic>" or not d.get("requestId"):
+        rid = d.get("requestId") or m.get("id")
+        if (m.get("model") or "") == "<synthetic>" or not rid:
             return False
         if d.get("isApiErrorMessage"):
             return False
         if not isinstance(m.get("usage"), dict):
             return False
-        return d.get("requestId") != self.req_last
+        return rid != self.req_last
 
     def feed_obj(self, d):
         if d.get("isSidechain") and not self.sidechain_ok:
@@ -673,6 +1413,19 @@ class Session:
                 self._ai_title = v
                 if self.title is None:
                     self.title = v
+        elif t == "provider_meta":
+            # a provider adapter's session facts (SPEC f2 → attach): the
+            # model context window is the budget, authoritative for that
+            # provider (a --budget pin still wins)
+            w = d.get("budget")
+            if isinstance(w, int) and w > 0 and not self.budget_pinned:
+                self.budget = w
+                self.provider_budget = True
+            if isinstance(d.get("title"), str) and d["title"] and self.title is None:
+                self.title = d["title"]
+        elif t == "provider_event":
+            self._event(d.get("kind") or "info", d.get("severity") or "info",
+                        d.get("timestamp") or "", d.get("msg") or "")
         # every other record type: metadata, tolerated and ignored
         if not self._sid_seen and isinstance(d.get("sessionId"), str):
             self.session_id = d["sessionId"]     # records outrank the filename
@@ -770,9 +1523,13 @@ class Session:
             self._event("api_error", "error", ts,
                         str(d.get("error") or "api error (synthetic turn)"))
             return
-        if model == "<synthetic>" or not d.get("requestId"):
+        # requestId is absent when a non-Anthropic backend serves the session
+        # (Ollama et al.); the streamed message id groups
+        # same-response upserts exactly like requestId, so it is the fallback
+        # turn key. True synthetics always carry model "<synthetic>".
+        rid = d.get("requestId") or m.get("id")
+        if model == "<synthetic>" or not rid:
             return  # synthetic: never a turn, never resident
-        rid = d.get("requestId")
         usage = m.get("usage") if isinstance(m.get("usage"), dict) else None
         content = m.get("content")
         # --- turn bookkeeping (LAST usage per requestId wins) ---
@@ -948,6 +1705,7 @@ class Session:
 
     def _on_turn_usage(self, tr, ts, new_turn=False):
         R = tr["resident"]
+        self.interim_R = None    # authoritative usage supersedes the boundary
         # budget auto-bump
         if not self.budget_pinned and R > self.budget:
             self._bump_budget(R, ts)
@@ -969,6 +1727,13 @@ class Session:
         # overhead calibration (the honesty rule)
         if self.overhead0 is None or self.rebase_pending:
             self.overhead0 = max(0, R - self.est_live)
+            if self.rebase_pending and not self.pending["map_rebuild"]:
+                # the compaction-time map went out sized to interim numbers;
+                # re-emit it now that the split is measured, or the interim
+                # map (field-found: a giant overhead slab) sticks until the
+                # next full rebuild
+                self.map_rev += 1
+                self.pending["map_rebuild"] = True
             self.rebase_pending = False
         E = self.live_est()
         # with a fit active the invisible overhead is the FITTED intercept
@@ -1022,6 +1787,23 @@ class Session:
                 self._event("pressure", "warn", ts,
                             "context %.0f%% of budget (amber)" % (frac * 100))
         self.zone = z
+        # local-backend truncation: the served window is a hard ceiling the
+        # CLI does not know about — pressure on Anthropic ends in a compaction,
+        # here it ends in the server silently dropping the OLDEST context.
+        # Warn on the upward crossing into the margin; re-arm only after real
+        # relief (compaction or rebuild pulls R back under 90%).
+        ctx = (self.backend or {}).get("ctx") if isinstance(self.backend, dict) \
+            else None
+        if ctx and (self.backend or {}).get("loaded"):
+            if R >= ctx - max(1024, ctx // 50):
+                if not self._trunc_warned:
+                    self._trunc_warned = True
+                    self._event("truncation", "error", ts,
+                                "R %dk at served window %dk — server will "
+                                "truncate oldest context"
+                                % (R // 1000, ctx // 1000))
+            elif R < int(ctx * 0.90):
+                self._trunc_warned = False
 
     def _bump_budget(self, need, ts):
         for rung in BUDGET_RUNGS:
@@ -1289,7 +2071,7 @@ class Session:
         ts = d.get("timestamp") or ""
         cm = d.get("compactMetadata") if isinstance(d.get("compactMetadata"), dict) else {}
         trigger = cm.get("trigger") if cm.get("trigger") in ("auto", "manual") else "manual"
-        pre = _i(cm.get("preTokens"))
+        pre = _i(cm.get("preTokens")) or self.resident()   # providers: R at the cut
         post = _i(cm.get("postTokens"))
         dur = _i(cm.get("durationMs"))
         # survivors
@@ -1350,6 +2132,10 @@ class Session:
             f["resident"] = fid in live_files
             if was != f["resident"]:
                 self.pending["files"].add(fid)
+        if post <= 0 and pre > 0:
+            # no authoritative post size (Gemini says nothing; Codex only the
+            # kept history): the evicted estimate is the best honest number
+            post = max(0, pre - int(evicted_est * self.alpha))
         dropped = max(0, pre - post)
         cum = _i(cm.get("cumulativeDroppedTokens"))
         self.cum_dropped = cum if cum else self.cum_dropped + dropped
@@ -1367,6 +2153,13 @@ class Session:
             if frac > self.t_auto:
                 self.t_auto = min(0.99, frac)
         self.rebase_pending = True
+        self.interim_R = post if post > 0 else None
+        if self.interim_R is not None:
+            # interim overhead by the same rule the rebase will apply
+            # (overhead = R − E), so the cut-time map/legend split stays
+            # sensible until the next usage record re-measures
+            self.overhead = max(0, self.interim_R
+                                - int(self.est_live * self.alpha))
         self.post_compact_grace = True
         self._compact_between = True     # this R drop is NOT a server rebuild
         self.zone = 0
@@ -1392,6 +2185,10 @@ class Session:
 
     def build_map_segs(self, cap=1024):
         R = self.resident()
+        if self.interim_R is not None:
+            # pre-cut R would dump the whole dropped span into the overhead
+            # seg via the sum-to-R correction below
+            R = min(R, self.interim_R)
         oh = {"id": 0, "cat": "overhead", "tok": int(self.overhead),
               "file": None, "born": 0, "ts": self.started_epoch}
         segs = [oh]
@@ -1494,14 +2291,24 @@ class Session:
                 "uuid": None, "born": 0, "est": 0, "tok": 0, "file": None,
                 "excerpt": "", "truncated": False}
         if sid == 0:
+            txt = ("Request preamble the transcript omits: the system "
+                   "prompt, tool schemas, skill listings and MCP "
+                   "instructions. Measured honestly as R minus everything "
+                   "visible (re-based at each compaction).")
+            if self.backend:
+                # local backend: the preamble IS observable — on the wire
+                item = None
+                rec = latest_proxy_record(self.model)
+                if rec:
+                    item = proxy_itemization(rec)
+                txt += "\n\n" + (item or (
+                    "The wire has it: run `amtr_engine.py --proxy "
+                    "--upstream %s` and point ANTHROPIC_BASE_URL at "
+                    "127.0.0.1:11435 to itemize this from the real "
+                    "request bytes." % self.backend.get("url", "...")))
             base.update({
                 "found": True, "cat": "overhead", "kind": "overhead",
-                "tok": int(self.overhead),
-                "excerpt": ("Server-side context the transcript cannot "
-                            "itemize: the system prompt, tool schemas, "
-                            "skill listings and MCP instructions. Measured "
-                            "honestly as R minus everything visible "
-                            "(re-based at each compaction).")})
+                "tok": int(self.overhead), "excerpt": txt})
             return base
         seg = self.ring.get(sid)
         if seg is None:
@@ -1601,12 +2408,24 @@ class Session:
         return {"rev": self.map_rev, "alpha": round(self.alpha, 4),
                 "fit": self.fit_payload(), "segs": segs}
 
+    def display_name(self):
+        """The distinct handle: roster/memorable name for Claude Code; the
+        project's basename + provider tag for other CLIs (matches the fleet
+        rows, so the picker and the ribbon agree)."""
+        if self.provider == "claude":
+            return session_name(self.session_id)
+        tag = {"codex": "cx", "gemini": "gm"}.get(self.provider, self.provider)
+        base = os.path.basename((self.project or "").rstrip("/"))
+        return "%s-%s" % (base or memorable_name(self.session_id), tag)
+
     def meta_payload(self):
         return {"session_id": self.session_id, "path": self.path,
                 "attach_gen": getattr(self, "attach_gen", 0),
-                "name": session_name(self.session_id),
+                "name": self.display_name(),
+                "provider": self.provider,
                 "project": self.project or "", "title": self.title,
                 "model": self.model or "?", "budget": int(self.budget),
+                "backend": self.backend,
                 "t_auto": round(self.t_auto, 4), "cc_version": self.cc_version,
                 "started_at": self.started_at}
 
@@ -1740,7 +2559,8 @@ class Session:
                 clone = Session(self.path, budget=self.budget,
                                 budget_pinned=self.budget_pinned,
                                 t_auto=0.85, ckpt_every=self.ckpt_every,
-                                sidechain_ok=self.sidechain_ok)
+                                sidechain_ok=self.sidechain_ok,
+                                provider=self.provider)
                 clone._no_ckpt = True
                 start_rec = 0
             rec_total = self.rec_count
@@ -1774,18 +2594,19 @@ class Session:
                             continue
                         if not isinstance(dd, dict):
                             continue
-                        if len(clone.turns) >= target and clone.is_new_turn(dd):
-                            clone.pending = _fresh_pending()
-                            return clone
                         clone.rec_offsets.append(0)
                         clone.rec_count += 1
-                        u = dd.get("uuid")
-                        if isinstance(u, str) and u not in clone.uuid_order:
-                            clone.uuid_order[u] = clone.rec_count
-                        try:
-                            clone.feed_obj(dd)
-                        except Exception:
-                            pass
+                        for rec in clone.translate(dd):
+                            if len(clone.turns) >= target and clone.is_new_turn(rec):
+                                clone.pending = _fresh_pending()
+                                return clone
+                            u = rec.get("uuid")
+                            if isinstance(u, str) and u not in clone.uuid_order:
+                                clone.uuid_order[u] = clone.rec_count
+                            try:
+                                clone.feed_obj(rec)
+                            except Exception:
+                                pass
                         if clone.rec_count >= rec_total and \
                                 len(clone.turns) >= target:
                             clone.pending = _fresh_pending()
@@ -1906,16 +2727,16 @@ def build_agent_map(path, budget):
 
 
 def tail_usage(path, span=65536):
-    """Resident tokens of the newest non-synthetic assistant usage, from a
-    bounded backward read. Returns int or None."""
+    """(resident tokens, model) of the newest non-synthetic assistant usage,
+    from a bounded backward read. Returns (int, str) or (None, "")."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
             fh.seek(max(0, size - span))
             data = fh.read(span + 1)
     except OSError:
-        return None
-    best = None
+        return None, ""
+    best, model = None, ""
     for line in data.split(b"\n"):
         if b'"usage"' not in line or b'"assistant"' not in line:
             continue
@@ -1923,16 +2744,21 @@ def tail_usage(path, span=65536):
             d = json.loads(line.decode("utf-8", "replace"))
         except Exception:
             continue
-        if not isinstance(d, dict) or d.get("type") != "assistant" or not d.get("requestId"):
+        if not isinstance(d, dict) or d.get("type") != "assistant":
             continue
         m = d.get("message")
         if not isinstance(m, dict) or (m.get("model") or "") == "<synthetic>":
+            continue
+        # message.id fallback: local backends write no requestId (same rule
+        # as _feed_assistant)
+        if not (d.get("requestId") or m.get("id")):
             continue
         u = m.get("usage")
         if isinstance(u, dict):
             best = (_i(u.get("input_tokens")) + _i(u.get("cache_read_input_tokens"))
                     + _i(u.get("cache_creation_input_tokens")))
-    return best
+            model = m.get("model") or model
+    return best, model
 
 def history_last_prompts(span=65536):
     """sessionId -> last prompt display, from the tail of ~/.claude/history.jsonl."""
@@ -1957,13 +2783,79 @@ def history_last_prompts(span=65536):
 
 _PREVIEW_SKIP = ("<command-", "<local-command", "<system-reminder", "<task-notification")
 
+def _provider_tail_msgs(provider, lines, max_msgs):
+    """Quicklook tail for Codex (event_msg user_message / agent_message) and
+    Gemini (message records, upsert by id — the last version wins)."""
+    out = []
+    if provider == "codex":
+        # response_item messages are the version-stable source: role:user
+        # minus the harness's injected context, role:assistant prose
+        for line in lines:
+            if b'"response_item"' not in line:
+                continue
+            try:
+                d = json.loads(line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            pl = d.get("payload") if isinstance(d, dict) else None
+            if not isinstance(pl, dict) or pl.get("type") != "message":
+                continue
+            role = txt = None
+            if pl.get("role") == "user":
+                t = codex_user_text(pl)
+                if t is not None:
+                    role, txt = "user", clean_text(t).strip()
+            elif pl.get("role") == "assistant":
+                role = "assistant"
+                txt = clean_text("\n".join(
+                    c.get("text") or "" for c in (pl.get("content") or [])
+                    if isinstance(c, dict))).strip()
+            if not txt:
+                continue
+            if out and out[-1]["role"] == role:
+                out[-1]["text"] = (out[-1]["text"] + "\n" + txt)[:700]
+            else:
+                out.append({"role": role, "text": txt[:700]})
+        return out[-max_msgs:]
+    if provider == "gemini":
+        seen = {}
+        order = []
+        for line in lines:
+            if b'"id"' not in line:
+                continue
+            try:
+                d = json.loads(line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if not isinstance(d, dict) or not isinstance(d.get("id"), str):
+                continue
+            role = {"user": "user", "gemini": "assistant"}.get(d.get("type"))
+            if not role:
+                continue
+            txt = clean_text(_gemini_parts_text(d.get("content"))).strip()
+            if d["id"] not in seen:
+                order.append(d["id"])
+            seen[d["id"]] = (role, txt)
+        for mid in order:
+            role, txt = seen[mid]
+            if not txt:
+                continue
+            if out and out[-1]["role"] == role:
+                out[-1]["text"] = (out[-1]["text"] + "\n" + txt)[:700]
+            else:
+                out.append({"role": role, "text": txt[:700]})
+        return out[-max_msgs:]
+    return out
+
+
 def transcript_tail_msgs(path, max_msgs=12, span=262144):
     """The conversation tail of a transcript, for the fleet quicklook
     (`fleet_peek`): the last user/assistant TEXT messages, oldest first,
     [{"role","text"}]. Tool results, meta records and harness wrappers
     (command echoes, system reminders) are skipped; consecutive same-role
     records (streamed assistant chunks) merge into one message. None on an
-    unreadable file."""
+    unreadable file. Provider transcripts (Codex, Gemini) go through
+    _provider_tail_msgs."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -1974,6 +2866,10 @@ def transcript_tail_msgs(path, max_msgs=12, span=262144):
     lines = data.split(b"\n")
     if size > span and lines:
         lines = lines[1:]                      # drop the partial first line
+    prov = detect_provider(path, first_line="" if size > span else
+                           lines[0].decode("utf-8", "replace") if lines else "")
+    if prov != "claude":
+        return _provider_tail_msgs(prov, lines, max_msgs)
     out = []
     for line in lines:
         if b'"type"' not in line:
@@ -2030,16 +2926,24 @@ def codex_tail_parse(lines):
     busy/idle is event-precise; token_count carries the last request's
     input size (the resident analog) and the model context window."""
     status = "idle"
-    res = bud = prompt = None
+    res = bud = prompt = total = None
     last_start = last_done = ""
     for raw in lines:
         try:
             d = json.loads(raw)
         except Exception:
             continue
+        p = d.get("payload") or {}
+        if d.get("type") == "response_item":
+            # the human's prompt (0.146 also mirrored it as event_msg
+            # user_message; 0.147 as item_completed — response_item is the
+            # version-stable source)
+            t = codex_user_text(p) if isinstance(p, dict) else None
+            if t and t.strip():
+                prompt = t.strip()[:200]
+            continue
         if d.get("type") != "event_msg":
             continue
-        p = d.get("payload") or {}
         pt = p.get("type")
         ts = d.get("timestamp") or ""
         if pt == "task_started":
@@ -2053,14 +2957,58 @@ def codex_tail_parse(lines):
                 res = last["input_tokens"]
             if isinstance(info.get("model_context_window"), int):
                 bud = info["model_context_window"]
+            tot = info.get("total_token_usage") or {}
+            if isinstance(tot.get("total_tokens"), int):
+                total = tot["total_tokens"]
         elif pt == "user_message":
             m = p.get("message")
-            if isinstance(m, str):
-                prompt = m[:200]
+            if isinstance(m, str) and m.strip():
+                prompt = m.strip()[:200]
     if last_start and last_start > last_done:
         status = "busy"
     return {"status": status, "resident": res, "budget": bud,
-            "last_prompt": prompt}
+            "last_prompt": prompt, "total": total,
+            "ended": bool(last_done and last_done >= last_start)}
+
+
+def gemini_tail_parse(lines):
+    """Status/usage from the tail of a Gemini CLI session recording. Gemini
+    writes no task events, so busy/idle is inferred from the last message:
+    a `user` record (or a `gemini` record without its tokens yet) means the
+    model is working; tokens.input is the resident analog; the model names
+    the context window."""
+    last_type = None
+    last_tokens = None
+    res = prompt = model = None
+    seen_tokens = set()
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str):
+            continue
+        t = d.get("type")
+        if t == "user":
+            last_type = "user"
+            last_tokens = None
+            txt = _gemini_parts_text(d.get("content"))
+            if txt.strip():
+                prompt = txt.strip()[:200]
+        elif t == "gemini":
+            last_type = "gemini"
+            tok = d.get("tokens") if isinstance(d.get("tokens"), dict) else None
+            last_tokens = tok
+            if tok is not None:
+                seen_tokens.add(d["id"])
+                if isinstance(tok.get("input"), int):
+                    res = tok["input"]
+            if isinstance(d.get("model"), str) and d["model"]:
+                model = d["model"]
+    busy = last_type == "user" or (last_type == "gemini" and last_tokens is None)
+    return {"status": "busy" if busy else "idle", "resident": res,
+            "budget": gemini_token_limit(model) if model else None,
+            "last_prompt": prompt, "model": model}
 
 
 def fleet_row_status(raw, alive, mtime, now):
@@ -2088,6 +3036,306 @@ def fleet_budget(base, resident):
             return max(base, r)
     return max(base, BUDGET_RUNGS[-1])
 
+# ---------------------------------------------------- local-backend probe
+# A session whose model is not an Anthropic name (e.g. `ollama launch
+# claude --model qwen3.8`) is served by a local/proxied backend. The
+# transcript cannot say WHAT serves it, but the machine can: the claude
+# process's env carries ANTHROPIC_BASE_URL, and an Ollama server answers
+# /api/ps with the loaded model's parameter size, quantization, and its
+# EFFECTIVE context window — which is the session's true budget. Everything
+# here is asked, never guessed: no answer -> no backend shown.
+
+def _env_kv(tokens):
+    """NAME=VALUE pairs from ps/environ token streams (values are URLs or
+    model names — never contain spaces, so token-wise parsing is safe)."""
+    out = {}
+    for t in tokens:
+        if "=" in t and re.match(r"^[A-Z][A-Z0-9_]*=", t):
+            k, _, v = t.partition("=")
+            out[k] = v
+    return out
+
+_MODEL_ENV_KEYS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                   "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                   "ANTHROPIC_DEFAULT_HAIKU_MODEL")
+
+def _proc_env(pid):
+    """Env of a same-user process: /proc on Linux, `ps -wwE` on macOS."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as fh:
+            return _env_kv(fh.read().decode("utf-8", "replace").split("\0"))
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-wwE", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+        return _env_kv(out.split())
+    except Exception:
+        return {}
+
+def _base_url_for_model(model):
+    """The ANTHROPIC_BASE_URL of the claude process that serves `model`.
+    Joined on the model NAME (env hints or --model arg), not the session id:
+    the transcript is the only place the session id lives, and no process
+    advertises it. A lone base_url-bearing claude process wins by default."""
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "pid=,command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    weak = None
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        head = cmd.split()[0] if cmd.split() else ""
+        if os.path.basename(head) != "claude" or " --bg-" in cmd:
+            continue
+        env = _proc_env(pid)
+        url = env.get("ANTHROPIC_BASE_URL")
+        if not url:
+            continue
+        hints = [env[k] for k in _MODEL_ENV_KEYS if env.get(k)]
+        m = re.search(r"--model[ =](\S+)", cmd)
+        if m:
+            hints.append(m.group(1))
+        if model in hints:
+            return url                      # strong join: named our model
+        weak = weak or url
+    return weak
+
+def _http_json(url, payload=None, timeout=2.5):
+    import urllib.request
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+def _ollama_pick(models, model):
+    """The entry serving `model`: exact name, then tag-stripped name."""
+    want = model.split(":")[0]
+    for m in models or []:
+        name = m.get("name") or m.get("model") or ""
+        if name == model or name.split(":")[0] == want:
+            return m
+    return None
+
+def _backend_from_entry(url, entry, loaded):
+    d = entry.get("details") or {}
+    info = {"kind": "ollama", "url": url,
+            "params": d.get("parameter_size") or "",
+            "quant": d.get("quantization_level") or "",
+            "ctx": None, "loaded": loaded}
+    for k in ("size", "size_vram"):
+        v = entry.get(k)
+        if isinstance(v, int) and v > 0:
+            info[k] = v
+    ctx = entry.get("context_length")
+    if not ctx:
+        # /api/show: model_info carries "<family>.context_length" — the
+        # model's MAX window, not the served one; better than nothing
+        mi = entry.get("model_info") or {}
+        for k, v in mi.items():
+            if k.endswith(".context_length"):
+                ctx = v
+                break
+    if isinstance(ctx, int) and ctx > 0:
+        info["ctx"] = ctx
+    return info
+
+def probe_local_backend(model, url=None):
+    """Identity of the local backend serving `model`, or None. Only the
+    /api/ps `context_length` is the served (budget-true) window."""
+    url = (url or _base_url_for_model(model)
+           or "http://localhost:11434").rstrip("/")
+    try:
+        if "version" not in _http_json(url + "/api/version"):
+            return None
+        entry = _ollama_pick(_http_json(url + "/api/ps").get("models"), model)
+        if entry:
+            return _backend_from_entry(url, entry, True)
+        entry = _http_json(url + "/api/show", {"model": model})
+        return _backend_from_entry(url, entry, False)
+    except Exception:
+        return None
+
+# ---------------------------------------------------- request-wire proxy
+# The transcript never carries the request preamble (system prompt, tool
+# schemas, MCP instructions) — that is a property of the CLIENT, not the
+# backend. But with a local backend the full request is on the wire, on the
+# user's own machine. `--proxy` is a recording passthrough: point
+# ANTHROPIC_BASE_URL at it, it forwards untouched and records each
+# request's COMPOSITION, so the overhead slab can be itemized from the real
+# bytes the model received instead of inferred as R minus visible.
+
+PROXY_DIR = os.path.expanduser("~/.claude/amtr-proxy")
+PROXY_LOG = os.path.join(PROXY_DIR, "requests.jsonl")
+
+def _jchars(v):
+    """Chars of a request part as serialized — the size the wire carried."""
+    if v is None:
+        return 0
+    if isinstance(v, str):
+        return len(v)
+    try:
+        return len(json.dumps(v, ensure_ascii=False))
+    except Exception:
+        return 0
+
+def proxy_compose(body):
+    """One composition record from a /v1/messages request body (bytes)."""
+    try:
+        d = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or "messages" not in d:
+        return None
+    tools = d.get("tools") if isinstance(d.get("tools"), list) else []
+    msgs = d.get("messages") if isinstance(d.get("messages"), list) else []
+    rec = {"ts": datetime.now(timezone.utc).isoformat(),
+           "model": str(d.get("model") or ""),
+           "system_chars": _jchars(d.get("system")),
+           "tools_n": len(tools), "tools_chars": _jchars(tools),
+           "msgs_n": len(msgs), "msgs_chars": _jchars(msgs),
+           "input_tokens": None}
+    rec["total_chars"] = (rec["system_chars"] + rec["tools_chars"]
+                          + rec["msgs_chars"])
+    return rec
+
+_IN_TOK_RE = re.compile(rb'"input_tokens"\s*:\s*(\d+)')
+
+def latest_proxy_record(model, max_age=900, span=65536):
+    """Newest proxy composition record for `model` (fresh within max_age s),
+    or None. Bounded backward read, same discipline as tail_usage."""
+    try:
+        size = os.path.getsize(PROXY_LOG)
+        with open(PROXY_LOG, "rb") as fh:
+            fh.seek(max(0, size - span))
+            data = fh.read(span + 1)
+    except OSError:
+        return None
+    best = None
+    for line in data.split(b"\n"):
+        try:
+            d = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("model") == model:
+            best = d
+    if best is None:
+        return None
+    try:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(best["ts"])).total_seconds()
+    except Exception:
+        return None
+    return best if 0 <= age <= max_age else None
+
+def proxy_itemization(rec):
+    """Human lines itemizing overhead from a composition record. The server
+    reported input_tokens for the WHOLE request; each part's share is its
+    serialized chars scaled by the one measured chars/token ratio — every
+    byte visible, only the ratio shared."""
+    tot_tok, tot_ch = rec.get("input_tokens"), rec.get("total_chars") or 0
+    if not tot_tok or not tot_ch:
+        return None
+    cpt = tot_ch / tot_tok
+    part = lambda ch: int(round(ch / cpt))
+    hh = (rec.get("ts") or "")[11:16]
+    return ("Itemized from the wire (amtr proxy, %sZ): system prompt "
+            "≈%s tok · %d tool schemas ≈%s tok · history ≈%s tok "
+            "(server-reported total %s tok)."
+            % (hh, fmt_tok(part(rec["system_chars"])), rec["tools_n"],
+               fmt_tok(part(rec["tools_chars"])),
+               fmt_tok(part(rec["msgs_chars"])), fmt_tok(tot_tok)))
+
+def fmt_tok(n):
+    return "%.1fk" % (n / 1000.0) if n >= 1000 else str(n)
+
+def run_proxy(args):
+    import urllib.request
+    import urllib.error
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    upstream = args.upstream.rstrip("/")
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    wlock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.0 + Connection: close — close-delimited responses let SSE
+        # stream through without re-implementing chunked framing
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _relay(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+            rec = None
+            if self.command == "POST" and "/messages" in self.path:
+                rec = proxy_compose(body)
+            req = urllib.request.Request(upstream + self.path,
+                                         data=body or None,
+                                         method=self.command)
+            skip = {"host", "content-length", "connection",
+                    "accept-encoding"}
+            for k, v in self.headers.items():
+                if k.lower() not in skip:
+                    req.add_header(k, v)
+            try:
+                resp = urllib.request.urlopen(req, timeout=600)
+            except urllib.error.HTTPError as e:
+                resp = e
+            except Exception as e:
+                self.send_error(502, str(e))
+                return
+            self.send_response(resp.getcode())
+            for k, v in resp.getheaders():
+                if k.lower() not in ("transfer-encoding", "connection",
+                                     "content-length"):
+                    self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # relay as the bytes arrive (SSE stays live); sniff the server's
+            # input_tokens for the composition record
+            sniff = b""
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                if rec is not None and rec["input_tokens"] is None \
+                        and len(sniff) < 262144:
+                    sniff += chunk
+                    m = _IN_TOK_RE.search(sniff)
+                    if m:
+                        rec["input_tokens"] = int(m.group(1))
+            if rec is not None:
+                with wlock:
+                    with open(PROXY_LOG, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(rec) + "\n")
+
+        do_GET = do_POST = do_DELETE = do_PUT = _relay
+
+    srv = ThreadingHTTPServer(("127.0.0.1", args.listen), Handler)
+    print("amtr proxy: 127.0.0.1:%d -> %s" % (args.listen, upstream),
+          file=sys.stderr)
+    print("recording request composition to %s" % PROXY_LOG,
+          file=sys.stderr)
+    print("point the client at it, e.g.:\n"
+          "  ANTHROPIC_BASE_URL=http://127.0.0.1:%d claude --model <name>"
+          % args.listen, file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+
 # ---------------------------------------------------------------- engine
 class Engine:
     def __init__(self, args):
@@ -2112,14 +3360,20 @@ class Engine:
         self._last_health_emit = 0.0
         self._last_growth = time.time()
         self._roster_cache = []
-        self._resident_cache = {}              # path -> (mtime, resident)
+        self._resident_cache = {}      # path -> (mtime, (resident, model))
+        self._backend_ctx = {}         # model -> served window (probe result)
         self._agent_map_cache = {}             # agent path -> (mtime, map|None)
         # seek coalescing (latest wins)
         self._seek_cond = threading.Condition()
         self._seek_pending = None
         self._seek_gen = 0
         self._fleet_force = threading.Event()
-        # codex provider caches (SPEC f2 providers; fleet feed only)
+        # provider caches (SPEC f2 providers): Codex CLI and Gemini CLI
+        # sessions join the roster (picker + wall + headless feed) and can be
+        # attached — the adapters translate their transcripts
+        self._gemini_cwd = {}        # pid -> cwd | None
+        self._gemini_tail = {}       # path -> (mtime, parsed)
+        self._gemini_reg = (0.0, {}) # (ts, project root -> short id)
         self._codex_files = {}       # pid -> rollout path | None
         self._codex_meta = {}        # path -> meta dict | None
         self._codex_tail = {}        # path -> (mtime, parsed)
@@ -2179,6 +3433,16 @@ class Engine:
                 os.path.splitext(os.path.basename(expanded))[0])
             if p:
                 return p
+            # a provider session id (Codex thread / Gemini session): the
+            # roster row carries its path
+            if isinstance(self._last_fleet, list):
+                for e in self._last_fleet:
+                    if e.get("id") == arg and e.get("path") and \
+                            os.path.isfile(e["path"]):
+                        return e["path"]
+            for _mt, path, meta in self._codex_recent_rollouts():
+                if meta.get("id") == arg:
+                    return path
         return None
 
     def pick_default(self):
@@ -2226,6 +3490,11 @@ class Engine:
         sess = Session(path, budget=self.budget, budget_pinned=self.budget_pinned,
                        sidechain_ok=sidechain)
         sess.attach_gen = self.attach_gen
+        if sess.provider == "gemini":
+            # the recording never names its project; the CLI's tmp dir does
+            root = self._gemini_root_of(path)
+            if root:
+                sess.project = root
         if sidechain:
             try:
                 with open(path[:-6] + ".meta.json", "r", encoding="utf-8") as fh:
@@ -2312,6 +3581,102 @@ class Engine:
         if meta != self._last_meta:
             self._last_meta = meta
             send(dict({"type": "meta"}, **meta))
+        self._maybe_probe_backend(sess)
+
+    # ---- local-backend probe ----------------------------------------------------
+    def _maybe_probe_backend(self, sess):
+        """Fire the probe once per (session, model), off-thread — the tail
+        loop must never wait on a network answer."""
+        m = sess.model
+        if (not m or m == "?" or sess.provider != "claude"
+                or m.startswith("claude-")):
+            return
+        if getattr(sess, "_probed_model", None) == m:
+            return
+        sess._probed_model = m
+        threading.Thread(target=self._probe_backend, args=(sess, m),
+                         daemon=True).start()
+
+    def _backend_event(self, sess, msg, severity="info"):
+        send({"type": "event", "kind": "backend", "severity": severity,
+              "ts": now_hhmmss(), "turn": max(0, len(sess.turns) - 1),
+              "msg": msg})
+
+    def _probe_backend(self, sess, model):
+        info = probe_local_backend(model)
+        if info is None:
+            return
+        with self.lock:
+            if self.session is not sess or sess.model != model:
+                return
+            sess.backend = info
+            ctx = info.get("ctx")
+            if info.get("loaded") and ctx:
+                self._backend_ctx[model] = int(ctx)   # fleet rows inherit it
+            if info.get("loaded") and ctx and not sess.budget_pinned \
+                    and ctx != sess.budget:
+                # /api/ps ctx is the SERVED window — authoritative, pin it
+                old, sess.budget = sess.budget, int(ctx)
+                sess.budget_pinned = True
+                self._backend_event(
+                    sess, "local backend %s (%s %s): budget %d -> %d"
+                    % (model, info.get("params") or "?",
+                       info.get("quant") or "?", old, sess.budget))
+            # partial CPU offload: the standing explanation for every slow
+            # turn that follows — said once, where the user looks when slow
+            size, vram = info.get("size"), info.get("size_vram")
+            if size and vram and vram < size * 0.95:
+                self._backend_event(
+                    sess, "vram %.1fG/%.1fG — partial CPU offload, "
+                    "slow decode expected" % (vram / 1e9, size / 1e9))
+            meta = sess.meta_payload()
+            if meta != self._last_meta:
+                self._last_meta = meta
+                send(dict({"type": "meta"}, **meta))
+        self._backend_watch(sess, model, info["url"])
+
+    def _backend_watch(self, sess, model, url):
+        """Slow /api/ps poll: model lifecycle as MOMENTS in the events feed —
+        unload (cold load ahead), reload (window may change). Transitions
+        only; a quiet server stays quiet. Runs until the session detaches."""
+        loaded = True
+        while not self._quitting.wait(15):
+            with self.lock:
+                if self.session is not sess or sess.model != model:
+                    return
+            try:
+                entry = _ollama_pick(
+                    _http_json(url + "/api/ps").get("models"), model)
+            except Exception:
+                continue                 # server hiccup: silent, keep watching
+            now_loaded = entry is not None
+            if now_loaded == loaded:
+                continue
+            loaded = now_loaded
+            with self.lock:
+                if self.session is not sess or sess.model != model:
+                    return
+                if not now_loaded:
+                    self._backend_event(
+                        sess, "model %s unloaded — cold load on next turn"
+                        % model)
+                    continue
+                info = _backend_from_entry(url, entry, True)
+                self._backend_event(sess, "model %s loaded" % model)
+                sess.backend = info
+                ctx = info.get("ctx")
+                if ctx:
+                    self._backend_ctx[model] = int(ctx)
+                if ctx and ctx != sess.budget:
+                    old, sess.budget = sess.budget, int(ctx)
+                    sess.budget_pinned = True
+                    self._backend_event(
+                        sess, "served window changed: budget %d -> %d"
+                        % (old, sess.budget))
+                meta = sess.meta_payload()
+                if meta != self._last_meta:
+                    self._last_meta = meta
+                    send(dict({"type": "meta"}, **meta))
 
     # ---- tail thread -------------------------------------------------------------
     def tail_loop(self):
@@ -2360,6 +3725,8 @@ class Engine:
 
     # ---- subagents ------------------------------------------------------------------
     def _scan_agents(self, sess):
+        if sess.provider != "claude":
+            return self._scan_provider_agents(sess)
         base = sess.path[:-6] if sess.path.endswith(".jsonl") else sess.path
         subdir = os.path.join(base, "subagents")
         if not os.path.isdir(subdir):
@@ -2509,6 +3876,74 @@ class Engine:
                                                    _journal_line)
 
     # ---- tasks -------------------------------------------------------------------------
+    def _scan_provider_agents(self, sess):
+        """Codex / Gemini subagents: the parent transcript announces them
+        (the adapter registers the agent), their OWN transcript is truth for
+        usage and completion — Codex: rollout-*-<thread id>.jsonl (task
+        events); Gemini: chats/<parent id>/<agent id>.jsonl (idle ⇒ done)."""
+        for aid, ag in list(sess.agents.items()):
+            p = ag.get("path")
+            if not p:
+                if sess.provider == "codex":
+                    hits = glob.glob(os.path.expanduser(
+                        "~/.codex/sessions/*/*/*/rollout-*-%s.jsonl" % aid))
+                    p = hits[0] if hits else None
+                else:
+                    cdir = os.path.dirname(sess.path)
+                    cand = os.path.join(cdir, sess.session_id, "%s.jsonl" % aid)
+                    p = cand if os.path.isfile(cand) else None
+                if p:
+                    ag["path"] = p
+                    sess.pending["agents"].add(aid)
+            if not p:
+                continue
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            st = self.agent_tails.get(p)
+            if st is not None and st.get("mt") == mt:
+                continue
+            lines = []
+            try:
+                with open(p, "rb") as fh:
+                    fh.seek(max(0, os.path.getsize(p) - 65536))
+                    lines = fh.read().decode("utf-8", "replace").splitlines()
+            except OSError:
+                continue
+            info = codex_tail_parse(lines) if sess.provider == "codex" \
+                else gemini_tail_parse(lines)
+            self.agent_tails[p] = {"mt": mt, "info": info}
+            # own_tok = the agent's last resident (the Claude rule: its
+            # last request's context size, not a cumulative bill)
+            own = info.get("resident")
+            if own is not None and own != ag["own_tok"]:
+                ag["own_tok"] = int(own)
+                sess.pending["agents"].add(aid)
+            # its OVERVIEW mini-map, through the same adapter path (cached
+            # by mtime — a 25-agent codex tree must not re-parse per tick)
+            c = self._agent_map_cache.get(p)
+            if c and c[0] == mt:
+                mp = c[1]
+            else:
+                mp = build_agent_map(p, sess.budget)
+                self._agent_map_cache[p] = (mt, mp)
+            if ag.get("map") != mp:
+                ag["map"] = mp
+                sess.pending["agents"].add(aid)
+            if ag["state"] == "running":
+                ag["ts_last"] = max(ag.get("ts_last") or 0.0, mt)
+                finished = info.get("ended") if sess.provider == "codex" \
+                    else info.get("status") == "idle"
+                # a finished-or-quiet transcript closes the agent (a
+                # transcript quiet for 5 min counts as finished either way)
+                if finished or time.time() - mt > 300:
+                    ag["state"] = "done"
+                    ag["turn1"] = sess.turn_at_epoch(mt)
+                    if ag.get("t0"):
+                        ag["dur_ms"] = max(0, int((mt - ag["t0"]) * 1000))
+                    sess.pending["agents"].add(aid)
+
     def _scan_tasks(self, sess, force=False):
         tdir = os.path.join(TASKS_DIR, sess.session_id)
         total = done = in_prog = 0
@@ -2570,19 +4005,20 @@ class Engine:
                 continue
             tp = find_transcript(sid)
             mt = 0.0
-            res = None
+            res, rmodel = None, ""
             if tp:
                 try:
                     mt = os.path.getmtime(tp)
                 except OSError:
                     pass
-                res = self._resident_of(tp, mt)
+                res, rmodel = self._resident_of(tp, mt)
             status = fleet_row_status(e.get("status"), e["_alive"], mt, now)
             out.append({"id": sid, "path": tp or "", "pid": e.get("pid"),
                         "name": e.get("name") or memorable_name(sid),
                         "project": e.get("cwd") or "",
                         "status": status, "mtime": mt, "live": e["_alive"],
-                        "resident": res, "budget": self._row_budget(res),
+                        "resident": res,
+                        "budget": self._row_budget(res, rmodel),
                         "last_prompt": prompts.get(sid),
                         # additive (SPEC b version-drift law): the session's
                         # tmux home "session:@window.%pane" when hosted there
@@ -2613,18 +4049,67 @@ class Engine:
         recents.sort(reverse=True)
         for mt, p, d in recents[:500]:
             sid = os.path.basename(p)[:-6]
-            res = self._resident_of(p, mt)
+            res, rmodel = self._resident_of(p, mt)
             out.append({"id": sid, "path": p, "pid": None,
                         "name": memorable_name(sid),
                         "project": d, "status": "offline", "mtime": mt,
                         "live": False, "resident": res,
-                        "budget": self._row_budget(res),
+                        "budget": self._row_budget(res, rmodel),
                         "last_prompt": prompts.get(sid)})
-        return out
+        # other providers: live rows first (interleaved with the live Claude
+        # rows by the front end's own sort), then their recent transcripts
+        try:
+            prov = self._codex_rows() + self._gemini_rows()
+            live_ids = {r["id"] for r in prov}
+            prov += [r for r in self._provider_recent_rows()
+                     if r["id"] not in live_ids]
+        except Exception as e:
+            log("provider scan error: %s" % e)
+            prov = []
+        live_rows = [r for r in out if r.get("live")]
+        rest = [r for r in out if not r.get("live")]
+        return live_rows + [r for r in prov if r.get("live")] + rest + \
+            [r for r in prov if not r.get("live")]
 
-    def _row_budget(self, resident):
-        """A fleet row's budget: pinned --budget verbatim, else the base
-        budget auto-bumped to fit the row's own resident (`fleet_budget`)."""
+    def _provider_recent_rows(self):
+        """Offline Codex rollouts (last two day-dirs) and Gemini recordings
+        (newest 60), so the picker can attach a finished session of either
+        CLI the same way it attaches an old Claude one."""
+        rows = []
+        for mt, path, meta in self._codex_recent_rollouts(days=30)[:60]:
+            base = os.path.basename((meta["cwd"] or "").rstrip("/")) or "codex"
+            rows.append({"id": meta["id"], "path": path, "pid": None,
+                         "name": "%s-cx" % base, "project": meta["cwd"] or "",
+                         "status": "offline", "mtime": mt, "live": False,
+                         "resident": None, "budget": self.budget,
+                         "last_prompt": None, "provider": "codex"})
+        found = []
+        for p in glob.glob(os.path.expanduser("~/.gemini/tmp/*/chats/session-*.jsonl")):
+            try:
+                found.append((os.path.getmtime(p), p))
+            except OSError:
+                continue
+        found.sort(reverse=True)
+        for mt, p in found[:60]:
+            short = os.path.basename(os.path.dirname(os.path.dirname(p)))
+            root = self._gemini_root_of(p)
+            base = os.path.basename(root.rstrip("/")) or short[:8]
+            rows.append({"id": self._gemini_sid(p), "path": p, "pid": None,
+                         "name": "%s-gm" % base, "project": root,
+                         "status": "offline", "mtime": mt, "live": False,
+                         "resident": None, "budget": self.budget,
+                         "last_prompt": None, "provider": "gemini"})
+        return rows
+
+    def _row_budget(self, resident, model=""):
+        """A fleet row's budget: a probe-confirmed served window when the
+        row's model has one (local sessions render on THEIR window, not an
+        Anthropic rung), else pinned --budget verbatim, else the base budget
+        auto-bumped to fit the row's own resident (`fleet_budget`)."""
+        if model and not model.startswith("claude-"):
+            ctx = self._backend_ctx.get(model)
+            if ctx:
+                return int(ctx)
         if self.budget_pinned:
             return self.budget
         return fleet_budget(self.budget, resident)
@@ -2668,12 +4153,12 @@ class Engine:
         self._codex_files[pid] = cwd
         return cwd
 
-    def _codex_recent_rollouts(self):
-        """Newest-first non-subagent rollouts from the last two day-dirs
+    def _codex_recent_rollouts(self, days=2):
+        """Newest-first non-subagent rollouts from the last `days` day-dirs
         (codex append-closes files, so open-file discovery is impossible —
         rows pair to processes by cwd + start time instead)."""
         base = os.path.expanduser("~/.codex/sessions")
-        day_dirs = sorted(glob.glob(os.path.join(base, "*", "*", "*")))[-2:]
+        day_dirs = sorted(glob.glob(os.path.join(base, "*", "*", "*")))[-days:]
         out = []
         for d in day_dirs:
             for p in glob.glob(os.path.join(d, "rollout-*.jsonl")):
@@ -2784,7 +4269,171 @@ class Engine:
                 "provider": "codex"})
         return rows
 
+    # ---- gemini provider (SPEC f2 providers) ---------------------------------
+    def _gemini_registry(self):
+        """~/.gemini/projects.json: project root -> short id (the tmp dir
+        name that holds the project's chats/). Refreshed at fleet cadence."""
+        ts, cached = self._gemini_reg
+        now = time.time()
+        if now - ts < 5.0:
+            return cached
+        reg = {}
+        try:
+            with open(os.path.expanduser("~/.gemini/projects.json"), "r",
+                      encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            pr = d.get("projects") if isinstance(d, dict) else None
+            if isinstance(pr, dict):
+                reg = {str(k): str(v) for k, v in pr.items()
+                       if isinstance(v, (str, int))}
+        except Exception:
+            reg = {}
+        self._gemini_reg = (now, reg)
+        return reg
+
+    def _gemini_root_of(self, path):
+        """The project root of a Gemini recording: ~/.gemini/tmp/<short>/
+        .project_root (the CLI writes it), else the registry's inverse."""
+        tmpdir = os.path.dirname(os.path.dirname(path))
+        try:
+            with open(os.path.join(tmpdir, ".project_root"), "r",
+                      encoding="utf-8") as fh:
+                root = fh.read().strip()
+            if root:
+                return root
+        except OSError:
+            pass
+        short = os.path.basename(tmpdir)
+        for k, v in self._gemini_registry().items():
+            if v == short:
+                return k
+        return ""
+
+    @staticmethod
+    def _gemini_sid(path):
+        """The session id of a recording: its first line's sessionId, else
+        the filename's 8-char tail."""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                d = json.loads(fh.readline())
+            if isinstance(d, dict) and isinstance(d.get("sessionId"), str):
+                return d["sessionId"]
+        except Exception:
+            pass
+        return os.path.basename(path)[:-6]
+
+    def _gemini_pids(self):
+        """Live Gemini CLI processes as (pid, tty, start_epoch): the CLI is a
+        node script, so match the script path, not the command name."""
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,tty=,lstart=,command="],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+        except Exception:
+            return []
+        rows = []
+        for ln in out.splitlines():
+            parts = ln.split(None, 7)
+            if len(parts) < 8:
+                continue
+            argv = parts[7].split()
+            head = [os.path.basename(a) for a in argv[:2]]
+            if "gemini" not in head and "gemini-cli" not in head:
+                continue
+            if any(a in ("--fleet",) for a in argv):
+                continue
+            try:
+                start = time.mktime(time.strptime(
+                    " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"))
+                rows.append((int(parts[0]), parts[1], start))
+            except (ValueError, OverflowError):
+                pass
+        return rows
+
+    def _proc_cwd(self, pid, cache):
+        if pid in cache:
+            return cache[pid]
+        cwd = None
+        try:
+            out = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5).stdout
+            for ln in out.splitlines():
+                if ln.startswith("n"):
+                    cwd = ln[1:]
+                    break
+        except Exception:
+            cwd = None
+        cache[pid] = cwd
+        return cwd
+
+    def _gemini_rows(self):
+        """Fleet rows for live Gemini CLI sessions (provider:"gemini").
+        Pairing law (the Codex one, with the registry in place of the
+        rollout's own cwd): each live gemini process claims the newest
+        unclaimed recording under its project's chats/ dir whose mtime is
+        not older than the process start."""
+        rows = []
+        pids = self._gemini_pids()
+        live = {p for p, _, _ in pids}
+        for k in list(self._gemini_cwd):
+            if k not in live:
+                self._gemini_cwd.pop(k, None)
+        if not pids:
+            return rows
+        reg = self._gemini_registry()
+        tmuxmap = self._codex_tmux_map()
+        claimed = set()
+        for pid, tty, start in pids:
+            cwd = self._proc_cwd(pid, self._gemini_cwd)
+            if not cwd:
+                continue
+            short = reg.get(cwd) or reg.get(os.path.realpath(cwd))
+            if not short:
+                short = hashlib.sha256(cwd.encode("utf-8")).hexdigest()
+            cdir = os.path.expanduser("~/.gemini/tmp/%s/chats" % short)
+            cands = []
+            for p in glob.glob(os.path.join(cdir, "session-*.jsonl")):
+                try:
+                    mt = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if p in claimed or mt < start - 60:
+                    continue
+                cands.append((mt, p))
+            if not cands:
+                continue
+            mt, path = max(cands)
+            claimed.add(path)
+            cached = self._gemini_tail.get(path)
+            if not cached or cached[0] != mt:
+                lines = []
+                try:
+                    with open(path, "rb") as fh:
+                        fh.seek(max(0, os.path.getsize(path) - 65536))
+                        lines = fh.read().decode("utf-8", "replace").splitlines()
+                except OSError:
+                    pass
+                cached = (mt, gemini_tail_parse(lines))
+                self._gemini_tail[path] = cached
+            info = cached[1]
+            status = info["status"]
+            if status == "busy" and time.time() - mt > 120:
+                status = "stalled"
+            base = os.path.basename(cwd.rstrip("/")) or "gemini"
+            rows.append({
+                "id": self._gemini_sid(path), "path": path, "pid": pid,
+                "name": "%s-gm" % base, "project": cwd,
+                "status": status, "mtime": mt, "live": True,
+                "resident": info["resident"],
+                "budget": info["budget"] or self.budget,
+                "last_prompt": info["last_prompt"],
+                "tmux": tmuxmap.get("/dev/" + tty),
+                "provider": "gemini"})
+        return rows
+
     def _resident_of(self, path, mtime):
+        """(resident, model) of a roster transcript, mtime-cached."""
         c = self._resident_cache.get(path)
         if c and c[0] == mtime:
             return c[1]
@@ -2824,6 +4473,11 @@ class Engine:
             if e.get("sessionId") == sid:
                 entry = e
                 break
+        if entry is None and isinstance(self._last_fleet, list):
+            for e in self._last_fleet:
+                if e.get("id") == sid and e.get("provider"):
+                    entry = {"name": e.get("name"), "pid": e.get("pid")}
+                    break
         name = (entry or {}).get("name") or memorable_name(sid)
         pid = (entry or {}).get("pid")
         if not pid_alive(pid):
@@ -2851,6 +4505,14 @@ class Engine:
             if e["sessionId"] == sess.session_id:
                 entry = e
                 break
+        if entry is None and sess.provider != "claude" and \
+                isinstance(self._last_fleet, list):
+            # provider sessions: the fleet row is the roster
+            for e in self._last_fleet:
+                if e.get("id") == sess.session_id and e.get("provider") \
+                        and e.get("live"):
+                    entry = {"_alive": True, "status": e.get("status")}
+                    break
         try:
             mt = os.path.getmtime(sess.path)
         except OSError:
@@ -2862,7 +4524,17 @@ class Engine:
             status = "dead"
         else:
             status = entry.get("status") or "idle"
-            if status == "busy" and now - max(mt, self._last_growth) > 120:
+            # stall threshold is API-shaped (120s); a local model legitimately
+            # thinks longer — scale by ITS observed rhythm (3x median turn
+            # duration), only when a backend is confirmed, so API sessions
+            # keep the exact historical behavior
+            limit = 120.0
+            if sess.backend:
+                durs = sorted(t["dur_ms"] for t in sess.turns[-32:]
+                              if t.get("dur_ms"))
+                if durs:
+                    limit = max(limit, 3.0 * durs[len(durs) // 2] / 1000.0)
+            if status == "busy" and now - max(mt, self._last_growth) > limit:
                 status = "stalled"
         payload = {"status": status, "last_activity_ts": mt,
                    "api_errors": sess.api_errors,
@@ -2876,7 +4548,8 @@ class Engine:
             send({"type": "event", "kind": "stall", "severity": "warn",
                   "ts": now_hhmmss(),
                   "turn": max(0, len(sess.turns) - 1),
-                  "msg": "no transcript growth for 120s while busy"})
+                  "msg": "no transcript growth for %ds while busy"
+                         % int(limit)})
         if changed or now - self._last_health_emit >= 5.0:
             self._last_health = payload
             self._last_health_emit = now
@@ -3700,9 +5373,8 @@ def run_fleet(args):
             sessions = eng._sess_entries()
             if args.live_only:
                 sessions = [s for s in sessions if s.get("live")]
-            # provider rows (SPEC f2): fleet feed only — the TUI cannot
-            # attach a non-Claude transcript, so they never join its picker
-            sessions = sessions + eng._codex_rows()
+            # provider rows (Codex, Gemini) are part of _sess_entries now:
+            # picker, wall, and this feed all see the same roster
         except Exception as e:
             log("fleet scan error: %s" % e)
             sessions = last
@@ -3757,6 +5429,16 @@ def main():
                     help="disable the per-category ratio fit: size every "
                          "category with the single global constant (the "
                          "pre-fit behaviour, for comparison)")
+    ap.add_argument("--proxy", action="store_true",
+                    help="recording passthrough between an Anthropic-API "
+                         "client and a local backend: forwards untouched, "
+                         "records each request's composition so overhead "
+                         "can be itemized from the real wire bytes")
+    ap.add_argument("--listen", type=int, default=11435,
+                    help="with --proxy: port to listen on (default 11435)")
+    ap.add_argument("--upstream", default="http://localhost:11434",
+                    help="with --proxy: backend base URL "
+                         "(default http://localhost:11434)")
     args = ap.parse_args()
     if args.cal:
         Est.chars_per_tok = args.cal
@@ -3772,6 +5454,8 @@ def main():
         sys.exit(run_report(args))
     if args.fleet:
         sys.exit(run_fleet(args))
+    if args.proxy:
+        sys.exit(run_proxy(args))
     Engine(args).run()
 
 if __name__ == "__main__":
