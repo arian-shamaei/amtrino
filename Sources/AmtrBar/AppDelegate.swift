@@ -1,6 +1,15 @@
 // The status item and its clocks. Redraw is driven by (a) fleet ticks and
-// (b) a 100 ms animation timer that runs ONLY while something on screen
-// animates (busy pulse / finish flash) — the TUI's clock discipline.
+// (b) an animation timer (IconRenderer.animHz, 4 Hz) that runs ONLY while
+// something on screen animates (busy pulse / finish flash) — the TUI's
+// clock discipline. Every redraw first computes a frame key; when the key
+// matches the last painted frame the button image is left alone. Why this
+// matters (field-found 2026-09-16, a full core for 34 h): each
+// `button.image =` makes AppKit re-snapshot the status item's replicant,
+// and that snapshot calls -[NSView setAppearance:], which fires the
+// effectiveAppearance KVO below, which redrew, which set the image again —
+// a closed loop with no timer in it. The dedupe breaks the loop (a redraw
+// with nothing new touches nothing); the observer also ignores KVO that
+// did not change the resolved light/dark answer.
 
 import AppKit
 import ServiceManagement
@@ -18,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     private var legendView: LegendView?
     private var lastPaletteMtime: Date?
     private var appearanceObs: NSKeyValueObservation?
+    /// Key of the frame currently on the button; nil forces a repaint.
+    private var lastFrameKey: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -28,8 +39,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // the bar's appearance changes often (light/dark, wallpaper tint,
         // per-display) — repaint the moment macOS re-resolves it, not on
         // the next fleet tick
+        // NOTE: this fires on every replicant re-snapshot too (see header);
+        // only a real light/dark flip may repaint
         appearanceObs = statusItem.button?.observe(\.effectiveAppearance) {
-            [weak self] _, _ in
+            [weak self] btn, _ in
+            let dark = btn.effectiveAppearance
+                .bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            guard dark != IconRenderer.barIsDark else { return }
             DispatchQueue.main.async { self?.redraw() }
         }
 
@@ -76,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             let m = AmtrPalette.fileMtime()
             if m != self.lastPaletteMtime {
                 self.lastPaletteMtime = m
+                self.invalidateFrame()
                 self.redraw()
             }
         }
@@ -117,8 +134,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
     }
 
+    /// Forget the painted frame so the next redraw paints unconditionally —
+    /// for inputs the frame key cannot see (custom theme edits, palette file).
+    private func invalidateFrame() { lastFrameKey = nil }
+
     private func redraw() {
-        defer { statusItem.button.map(dumpFrame) }
         guard let btn = statusItem.button else { return }
         // identity mode adapts to the bar it actually sits on
         let dark = btn.effectiveAppearance
@@ -127,43 +147,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             NSLog("%@", "amtrino: bar appearance -> \(dark ? "dark" : "light") (\(btn.effectiveAppearance.name.rawValue))")
         }
         IconRenderer.barIsDark = dark
-        guard linkUp else {
-            btn.image = IconRenderer.linkDownImage()
-            btn.attributedTitle = NSAttributedString(string: "")
-            return
-        }
+
+        // Decide the frame first; paint only if it differs from what is
+        // already on the button (see the header comment).
         let now = Date()
-        switch Settings.mode {
-        case .grid:
-            let slots = store.slotted(hidden: Settings.hidden,
-                                      slots: Settings.slots)
-            btn.image = slots.allSatisfy { $0 == nil }
-                ? IconRenderer.emptyFleetImage()
-                : IconRenderer.gridImage(slots, now: now)
-            btn.attributedTitle = NSAttributedString(string: "")
-        case .single:
-            guard let one = store.single(pinned: Settings.pinned) else {
-                // healthy feed, no sessions: the empty grid, not "dead"
-                btn.image = IconRenderer.emptyFleetImage()
+        var key = "\(dark ? "d" : "l")|\(Settings.themeRaw)|"
+        let paint: () -> Void
+        if !linkUp {
+            key += "down"
+            paint = {
+                btn.image = IconRenderer.linkDownImage()
                 btn.attributedTitle = NSAttributedString(string: "")
-                return
             }
-            switch Settings.singleStyle {
-            case .tank:
-                btn.image = IconRenderer.tankImage(one, now: now)
-                btn.attributedTitle = NSAttributedString(string: "")
-            case .percent:
-                btn.image = nil
-                btn.attributedTitle = IconRenderer.percentTitle(one)
+        } else {
+            switch Settings.mode {
+            case .grid:
+                let slots = store.slotted(hidden: Settings.hidden,
+                                          slots: Settings.slots)
+                if slots.allSatisfy({ $0 == nil }) {
+                    key += "empty"
+                    paint = {
+                        btn.image = IconRenderer.emptyFleetImage()
+                        btn.attributedTitle = NSAttributedString(string: "")
+                    }
+                } else {
+                    key += "grid:" + IconRenderer.frameKey(slots, now: now)
+                    paint = {
+                        btn.image = IconRenderer.gridImage(slots, now: now)
+                        btn.attributedTitle = NSAttributedString(string: "")
+                    }
+                }
+            case .single:
+                guard let one = store.single(pinned: Settings.pinned) else {
+                    // healthy feed, no sessions: the empty grid, not "dead"
+                    key += "empty"
+                    if key != lastFrameKey {
+                        btn.image = IconRenderer.emptyFleetImage()
+                        btn.attributedTitle = NSAttributedString(string: "")
+                        lastFrameKey = key
+                        dumpFrame(btn)
+                    }
+                    return
+                }
+                switch Settings.singleStyle {
+                case .tank:
+                    key += "tank:" + IconRenderer.frameKey(one, now: now)
+                    paint = {
+                        btn.image = IconRenderer.tankImage(one, now: now)
+                        btn.attributedTitle = NSAttributedString(string: "")
+                    }
+                case .percent:
+                    // text does not animate: no clock in this key
+                    let pct = Int(((one.sess.fill ?? -0.01) * 100).rounded())
+                    key += "pct:\(one.sess.id)/\(pct)"
+                    paint = {
+                        btn.image = nil
+                        btn.attributedTitle = IconRenderer.percentTitle(one)
+                    }
+                }
             }
         }
+        guard key != lastFrameKey else { return }
+        paint()
+        lastFrameKey = key
+        dumpFrame(btn)
     }
 
-    /// Arm the 100 ms clock only while something animates.
+    /// Arm the animation clock only while something animates.
     private func retimer() {
         let animating = linkUp && store.animating(hidden: Settings.hidden)
         if animating, animTimer == nil {
-            animTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            animTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / IconRenderer.animHz,
+                                             repeats: true) { [weak self] _ in
                 guard let self else { return }
                 self.redraw()
                 if !(self.linkUp && self.store.animating(hidden: Settings.hidden)) {
@@ -461,12 +516,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
 
     @objc private func newCustomTheme() {
-        ThemeManager.shared.onChange = { [weak self] in self?.redraw() }
+        ThemeManager.shared.onChange = { [weak self] in
+            self?.invalidateFrame(); self?.redraw()
+        }
         ThemeManager.shared.show(newDraft: true)
     }
 
     @objc private func manageThemes() {
-        ThemeManager.shared.onChange = { [weak self] in self?.redraw() }
+        ThemeManager.shared.onChange = { [weak self] in
+            self?.invalidateFrame(); self?.redraw()
+        }
         ThemeManager.shared.show(newDraft: false)
     }
 

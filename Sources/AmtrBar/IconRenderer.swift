@@ -384,10 +384,45 @@ enum IconRenderer {
 
     // MARK: animation laws
 
-    /// Busy pulse position 0...1 at ~0.8 Hz.
+    /// Animation clock rate. Every time-varying style samples `now` on this
+    /// grid, so two redraws inside one tick render identical pixels and the
+    /// frame key (below) lets the status item skip the re-snapshot — the
+    /// expensive part of a menu-bar redraw is AppKit re-capturing the item,
+    /// not our drawing.
+    static let animHz: Double = 4
+
+    /// Tick index of `now` on the animation clock.
+    static func animTick(_ now: Date) -> Int {
+        Int((now.timeIntervalSinceReferenceDate * animHz).rounded(.down))
+    }
+
+    /// Busy pulse position 0...1 at ~0.8 Hz, sampled on the animation clock.
     private static func pulse01(_ now: Date, phase: Double) -> Double {
-        let t = now.timeIntervalSinceReferenceDate
+        let t = Double(animTick(now)) / animHz
         return 0.5 + 0.5 * sin(t * 2 * .pi * 0.8 + phase)
+    }
+
+    // MARK: frame keys — "would this redraw change any pixel?"
+
+    /// Everything a session's dot/tank depends on, as a string. Two equal
+    /// keys render identically (given equal theme and bar appearance), so
+    /// the caller can skip setting the button image. Time enters only in
+    /// the states that animate.
+    static func frameKey(_ d: DisplaySession, now: Date) -> String {
+        let fill = Int(((d.sess.fill ?? -0.01) * 100).rounded())
+        var clock = "-"
+        if let ago = d.finishedAgo {
+            clock = "f\(Int(ago * 4))"
+        } else if d.sess.status == .busy {
+            clock = "b\(animTick(now))"
+        }
+        return "\(d.sess.id)/\(d.sess.status)/\(fill)/\(clock)"
+    }
+
+    /// Frame key for the whole grid (nil slot = "_").
+    static func frameKey(_ slots: [DisplaySession?], now: Date) -> String {
+        slots.prefix(9).map { $0.map { frameKey($0, now: now) } ?? "_" }
+            .joined(separator: "|")
     }
 
     /// Per-session phase from the identity seed so busy dots breathe
